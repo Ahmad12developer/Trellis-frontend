@@ -17,6 +17,7 @@
     "test:e2e:chaos": "playwright test e2e/chaos.spec.ts",
     "validate:invariants": "node scripts/validate-domain-invariants.mjs",
     "dr:validate": "node scripts/validate-domain-invariants.mjs",
+    "restore:verify": "tsx scripts/verify-snapshot-restore.ts",
     "monitor:invariants": "tsx scripts/monitor-invariants.ts",
     "validate:events": "tsx scripts/validate-domain-events.ts",
     "telemetry:ws": "node scripts/telemetry-ws-server.mjs",

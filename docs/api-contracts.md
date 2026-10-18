@@ -98,3 +98,11 @@ All API error responses follow the standard Trellis error payload:
   "details": []
 }
 ```
+
+Routes backed by the problem-details taxonomy additionally return an RFC 9457
+`application/problem+json` document. That shape is a strict superset: `error`
+and `code` are unchanged, and `detail`, `remediation`, `retryable`, `docs`,
+`taxonomyVersion`, and `correlationId` are additive. `code` values are stable
+machine codes from `lib/api-contracts/problem-details.ts`; the full catalog,
+payload example, edge cases, and recovery steps live in
+[`docs/problem-details.md`](./problem-details.md).

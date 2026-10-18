@@ -141,5 +141,63 @@
       "rewardAmount": 25,
       "rewardStatus": "paid"
     }
-  ]
+  ],
+  "schemaVersion": "trellis.restore.v1",
+  "derivedIndexes": {
+    "referral-code-owners": {
+      "indexId": "referral-code-owners",
+      "version": 1,
+      "sourceCount": 1,
+      "values": {
+        "ASTRDEMO12": {
+          "ownerWallet": "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN7"
+        }
+      },
+      "digest": "fnv1a32:63dc7d02"
+    },
+    "payout-totals-by-wallet": {
+      "indexId": "payout-totals-by-wallet",
+      "version": 1,
+      "sourceCount": 1,
+      "values": {
+        "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN7": {
+          "count": 1,
+          "completedXlm": 150,
+          "reservedXlm": 0,
+          "failedXlm": 0,
+          "totalXlm": 150
+        }
+      },
+      "digest": "fnv1a32:5a2a85e0"
+    },
+    "referrals-by-code": {
+      "indexId": "referrals-by-code",
+      "version": 1,
+      "sourceCount": 1,
+      "values": {
+        "ASTRDEMO12": {
+          "total": 1,
+          "converted": 1,
+          "other": 0,
+          "commissionXlm": 150
+        }
+      },
+      "digest": "fnv1a32:11d2ef9f"
+    },
+    "test-executions-by-case": {
+      "indexId": "test-executions-by-case",
+      "version": 1,
+      "sourceCount": 1,
+      "values": {
+        "tc-101": {
+          "total": 1,
+          "completed": 1,
+          "failed": 0,
+          "active": 0,
+          "averageQualityScore": 96
+        }
+      },
+      "digest": "fnv1a32:6d8a3822"
+    }
+  }
 }

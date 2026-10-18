@@ -44,6 +44,9 @@ jobs:
       - name: Monitor domain invariants
         run: npm run monitor:invariants -- --fail-on error
 
+      - name: Verify snapshot restore and derived indexes
+        run: npm run restore:verify
+
       - name: Build
         run: npm run build
 
