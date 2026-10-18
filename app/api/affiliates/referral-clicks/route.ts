@@ -4,6 +4,7 @@ import {
   recordReferralClickEvent,
 } from '@/lib/affiliate-store';
 import { VanitySlugError } from '@/lib/vanity-slug';
+import { csrfMiddleware } from '@/lib/security/csrf';
 
 /**
  * GET /api/affiliates/referral-clicks?wallet=<address>&days=30
@@ -42,6 +43,9 @@ export async function GET(request: NextRequest) {
 }
 
 export async function POST(request: NextRequest) {
+  const csrfError = csrfMiddleware(request);
+  if (csrfError) return csrfError;
+
   try {
     const body = await request.json();
     const { slug, referrer, userAgent, conversionStatus, kind } = body ?? {};

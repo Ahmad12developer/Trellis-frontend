@@ -242,10 +242,19 @@ export function normaliseAlertPreferences(value: unknown): AlertPreferences {
       typeof raw.volume === "number" && Number.isFinite(raw.volume)
         ? Math.min(1, Math.max(0, raw.volume))
         : DEFAULT_ALERT_PREFERENCES.volume,
-    mutedCategories: {
-      ...DEFAULT_ALERT_PREFERENCES.mutedCategories,
-      ...(raw.mutedCategories ?? {}),
-    },
+    mutedCategories: (() => {
+      const result: Record<NotificationCategory, boolean> = {
+        ...DEFAULT_ALERT_PREFERENCES.mutedCategories,
+      };
+      if (raw.mutedCategories && typeof raw.mutedCategories === 'object') {
+        for (const cat of NOTIFICATION_CATEGORIES) {
+          if (typeof (raw.mutedCategories as any)[cat.id] === 'boolean') {
+            result[cat.id] = (raw.mutedCategories as any)[cat.id];
+          }
+        }
+      }
+      return result;
+    })(),
     quietHours: {
       enabled: quietHours.enabled === true,
       start: isTimeString(quietHours.start) ? (quietHours.start as string) : DEFAULT_QUIET_HOURS.start,

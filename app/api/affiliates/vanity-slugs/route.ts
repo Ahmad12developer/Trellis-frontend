@@ -6,6 +6,7 @@ import {
   resolveVanitySlug,
 } from '@/lib/affiliate-store';
 import { validateVanitySlug, VanitySlugError } from '@/lib/vanity-slug';
+import { csrfMiddleware } from '@/lib/security/csrf';
 
 /**
  * GET /api/affiliates/vanity-slugs
@@ -61,6 +62,9 @@ export async function GET(request: NextRequest) {
 }
 
 export async function POST(request: NextRequest) {
+  const csrfError = csrfMiddleware(request);
+  if (csrfError) return csrfError;
+
   try {
     const body = await request.json();
     const { walletAddress, slug, targetAgentId } = body ?? {};

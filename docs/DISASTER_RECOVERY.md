@@ -26,6 +26,30 @@ npm run validate:invariants
 npm run dr:validate
 ```
 
+## Resource Budget Checks
+
+Run the deterministic worst-case user activity, ledger history, and catalog search
+workloads before promoting changes that affect dashboard data processing:
+
+```bash
+npm run test:resource-budgets
+```
+
+The limits are versioned in `scripts/resource-budgets.json`. The check reports
+elapsed time and JavaScript heap growth for each generated workload, and exits
+nonzero if a record, result, time, or heap budget is exceeded. These synthetic
+checks catch local processing regressions; they do not replace production
+profiling or measure network and database costs.
+
+If a budget fails, first rerun it on the same Node version and machine to confirm
+the result. Use a heap or CPU profile to identify the workload's allocation or
+hot loop, then reduce retained data, bound pagination/results, or avoid repeated
+scans. Keep the workload size fixed while comparing before and after results.
+Change a budget only when measured product capacity justifies the new limit, and
+record the capacity rationale alongside the change. Do not increase a limit only
+to make a failing check pass. If the check fails in CI but passes locally, compare
+Node versions and runner memory limits before adjusting application code.
+
 ### Validating a Restored Database Snapshot / Dump
 
 When restoring from an external JSON dump or database export:

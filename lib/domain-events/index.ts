@@ -66,6 +66,17 @@ export {
 } from './registry';
 
 export {
+  buildSnapshot,
+  checkSchemaEvolution,
+  checkVersionChain,
+  describeSchema,
+  diffSchemas,
+  type CompatProblem,
+  type SchemaDescriptor,
+  type SchemaSnapshot,
+} from './compat';
+
+export {
   createBroadcastDelivery,
   createWindowDelivery,
   publishDomainEvent,

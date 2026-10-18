@@ -7,6 +7,7 @@ import { provenanceExport } from "../../../lib/provenance/export";
 import ProvenanceFilter from "./ProvenanceFilter";
 import ZkVerificationBadge from "./ZkVerificationBadge";
 import ZkProofInspector from "./ZkProofInspector";
+import MerkleProofInspector from "./MerkleProofInspector";
 import { extractAttestation } from "../zk/attestation";
 import type { AgentExecutionAttestation, ZkVerificationResult } from "../zk/types";
 

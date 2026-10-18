@@ -1,4 +1,5 @@
 import crypto from 'crypto';
+import { isFieldSafe } from './metric-definitions';
 
 export type WebhookEventTrigger = 'new_proposal' | 'high_error_rate' | 'payout_executed' | 'agent_minted';
 
@@ -27,6 +28,37 @@ export interface EmailDigestPreferences {
 }
 
 /**
+ * Recursively remove fields that are outside the platform's sensitive-data
+ * boundary before an event is serialized for a third-party webhook.
+ * Cycles and values deeper than eight levels are omitted so malformed input
+ * cannot make dispatch fail while building its body.
+ */
+export function sanitizeWebhookData(data: Record<string, any>): Record<string, any> {
+  const seen = new WeakSet<object>();
+
+  const visit = (value: unknown, depth: number): unknown => {
+    if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
+    if (typeof value === 'number') return Number.isFinite(value) ? value : undefined;
+    if (typeof value !== 'object' || depth > 8 || seen.has(value)) return undefined;
+    seen.add(value);
+
+    if (Array.isArray(value)) {
+      return value.map((item) => visit(item, depth + 1)).filter((item) => item !== undefined);
+    }
+
+    const safe: Record<string, unknown> = {};
+    for (const [key, nested] of Object.entries(value)) {
+      if (!isFieldSafe(key)) continue;
+      const sanitized = visit(nested, depth + 1);
+      if (sanitized !== undefined) safe[key] = sanitized;
+    }
+    return safe;
+  };
+
+  return (visit(data, 0) as Record<string, any> | undefined) ?? {};
+}
+
+/**
  * Sign a webhook payload string or object using HMAC-SHA256 and return hex header format (sha256=<hex>)
  */
 export function signWebhookPayload(payload: string | object, secret: string): string {
@@ -52,7 +84,7 @@ export function formatWebhookPayload(event: WebhookEventTrigger, data: Record<st
     event,
     timestamp: new Date().toISOString(),
     data: {
-      ...data,
+      ...sanitizeWebhookData(data),
       platform: 'Trellis Stellar Agent Platform',
     },
   };

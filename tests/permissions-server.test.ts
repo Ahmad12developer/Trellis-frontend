@@ -435,6 +435,8 @@ describe('route-level enforcement', () => {
       );
       expect(status).toBe(200);
       expect(body.success).toBe(true);
+      expect(body.ledgerEntry).toMatchObject({ sequence: expect.any(Number) });
+      expect(body.ledgerEntry.hash).toMatch(/^[0-9a-f]{64}$/);
     });
 
     it('rejects a contributor reading the audit trail with 403', async () => {
@@ -454,6 +456,15 @@ describe('route-level enforcement', () => {
       );
       expect(status).toBe(200);
       expect(body.success).toBe(true);
+      expect(body.ledger).toMatchObject({
+        schemaVersion: 1,
+        verification: { valid: true },
+      });
+      expect(body.ledger.entries[0]).toMatchObject({
+        category: 'privileged',
+        eventType: 'security.audit.recorded',
+        actorId: 'alice',
+      });
     });
   });
 });

@@ -63,6 +63,9 @@ export interface OfflineSubmission {
   label: string;
   createdAt: string;
   attempts: number;
+  /** A 409/412 response means the captured state is stale and needs a choice. */
+  status?: 'pending' | 'conflict';
+  lastError?: string;
 }
 
 export interface OfflineSubmissionInput {
@@ -82,7 +85,7 @@ export interface OfflineQueue {
   enqueue(input: OfflineSubmissionInput): Promise<OfflineSubmission>;
   list(): Promise<OfflineSubmission[]>;
   size(): Promise<number>;
-  update(id: string, patch: { attempts?: number }): Promise<OfflineSubmission | null>;
+  update(id: string, patch: { attempts?: number; status?: 'pending' | 'conflict'; lastError?: string }): Promise<OfflineSubmission | null>;
   remove(id: string): Promise<boolean>;
   clear(): Promise<void>;
 }
@@ -191,6 +194,8 @@ function coerceSubmission(value: unknown): OfflineSubmission | null {
     createdAt:
       typeof record.createdAt === 'string' ? record.createdAt : new Date(0).toISOString(),
     attempts,
+    ...(record.status === 'conflict' ? { status: 'conflict' as const } : {}),
+    ...(typeof record.lastError === 'string' ? { lastError: record.lastError } : {}),
   };
 }
 
@@ -346,7 +351,12 @@ export function createOfflineQueue(
             : items[index].attempts;
 
         const next = [...items];
-        next[index] = { ...items[index], attempts };
+        next[index] = {
+          ...items[index],
+          attempts,
+          ...(patch.status ? { status: patch.status } : {}),
+          ...(patch.lastError !== undefined ? { lastError: patch.lastError } : {}),
+        };
         await write(next);
 
         return next[index];
@@ -396,6 +406,7 @@ export async function flushOfflineQueue(
   const pending = await queue.list();
 
   for (const submission of pending) {
+    if (submission.status === 'conflict') break;
     let response: Response | null = null;
 
     try {
@@ -416,6 +427,14 @@ export async function flushOfflineQueue(
       await queue.remove(submission.id);
       result.synced.push(submission.id);
       continue;
+    }
+
+    if (response && (response.status === 409 || response.status === 412)) {
+      await queue.update(submission.id, {
+        status: 'conflict',
+        lastError: `Server state changed (HTTP ${response.status}). Review current state before retrying.`,
+      });
+      break;
     }
 
     if (response && response.status >= 400 && response.status < 500) {
@@ -470,22 +489,31 @@ class PWAManager {
         this.swRegistration = registration;
         console.log('[PWA] Service worker registered successfully');
 
-        // Listen for updates
-        registration.addEventListener('updatefound', () => {
-          const newWorker = registration.installing;
-          if (newWorker) {
-            newWorker.addEventListener('statechange', () => {
-              if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
-                // New content is available
-                this.onServiceWorkerUpdate();
+        if (registration) {
+          // Check if an updated worker is already waiting
+          if (registration.waiting && navigator.serviceWorker.controller) {
+            this.onServiceWorkerUpdate();
+          }
+
+          // Listen for updates
+          if (typeof registration.addEventListener === 'function') {
+            registration.addEventListener('updatefound', () => {
+              const newWorker = registration.installing;
+              if (newWorker && typeof newWorker.addEventListener === 'function') {
+                newWorker.addEventListener('statechange', () => {
+                  if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
+                    // New content is available
+                    this.onServiceWorkerUpdate();
+                  }
+                });
               }
             });
           }
-        });
 
-        // Check for existing updates
-        if (registration.active) {
-          registration.active.postMessage({ type: 'CHECK_UPDATE' });
+          // Check for existing updates
+          if (registration.active) {
+            registration.active.postMessage({ type: 'CHECK_UPDATE' });
+          }
         }
 
       } catch (error) {
@@ -561,6 +589,19 @@ class PWAManager {
   }
 
   public async skipWaiting(): Promise<void> {
+    if (!this.swRegistration?.waiting) {
+      if (typeof window !== 'undefined' && 'serviceWorker' in navigator && typeof navigator.serviceWorker.getRegistration === 'function') {
+        try {
+          const reg = await navigator.serviceWorker.getRegistration();
+          if (reg?.waiting) {
+            this.swRegistration = reg;
+          }
+        } catch {
+          // ignore
+        }
+      }
+    }
+
     if (!this.swRegistration || !this.swRegistration.waiting) {
       console.log('[PWA] No waiting service worker found');
       return;
@@ -572,6 +613,14 @@ class PWAManager {
     } catch (error) {
       console.error('[PWA] Error sending skip waiting message:', error);
     }
+  }
+
+  public getRegistration(): ServiceWorkerRegistration | null {
+    return this.swRegistration;
+  }
+
+  public hasWaitingWorker(): boolean {
+    return Boolean(this.swRegistration?.waiting);
   }
 
   public isInstallPromptAvailable(): boolean {
@@ -737,6 +786,32 @@ class PWAManager {
       console.error('[PWA] Error reading offline queue size:', error);
       return 0;
     }
+  }
+
+  public async getConflictedSubmissions(): Promise<OfflineSubmission[]> {
+    return (await this.getOfflineQueue().list()).filter((item) => item.status === 'conflict');
+  }
+
+  /** Explicitly return a conflicted operation to the FIFO replay queue. */
+  public async retryConflictedSubmission(id: string): Promise<boolean> {
+    const updated = await this.getOfflineQueue().update(id, {
+      status: 'pending',
+      attempts: 0,
+      lastError: '',
+    });
+    if (!updated) return false;
+    await this.emitQueueChange();
+    await this.registerBackgroundSync();
+    return true;
+  }
+
+  /** Explicitly discard a conflicted operation after the user reviews it. */
+  public async discardConflictedSubmission(id: string): Promise<boolean> {
+    const item = (await this.getOfflineQueue().list()).find((entry) => entry.id === id);
+    if (!item || item.status !== 'conflict') return false;
+    const removed = await this.getOfflineQueue().remove(id);
+    if (removed) await this.emitQueueChange();
+    return removed;
   }
 
   private async emitQueueChange(): Promise<number> {

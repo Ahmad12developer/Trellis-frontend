@@ -12,6 +12,21 @@ interface TimelineEntryProps {
   severity?: EventSeverity;
 }
 
+/** Only render navigable resource links with a non-executable URL scheme. */
+export function safeTimelineResourceHref(value: string | undefined): string | null {
+  if (!value) return null;
+  const candidate = value.trim();
+  if (!candidate || candidate.startsWith("//") || /[\u0000-\u001f\u007f\\]/.test(candidate)) return null;
+
+  try {
+    const parsed = new URL(candidate, "https://trellis.invalid");
+    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return null;
+    return candidate;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Renders a single timeline entry with a stable link to the resource.
  *
@@ -22,6 +37,7 @@ export function TimelineEntry({ event, severity = "info" }: TimelineEntryProps) 
   const label = EVENT_TYPE_LABELS[event.type];
   const formattedDate = new Date(event.timestamp).toLocaleString();
   const findings = event.redactionFindings ?? [];
+  const resourceHref = safeTimelineResourceHref(event.resourceUrl);
 
   return (
     <div
@@ -49,9 +65,10 @@ export function TimelineEntry({ event, severity = "info" }: TimelineEntryProps) 
             </p>
           )}
 
-          {event.resourceUrl && (
+          {resourceHref && (
             <a
-              href={event.resourceUrl}
+              href={resourceHref}
+              rel="noopener noreferrer"
               className="mt-2 inline-block text-sm text-amber-600 hover:underline"
             >
               View Details →

@@ -2,22 +2,34 @@ import { test, expect } from '@playwright/test';
 import { enableNetworkChaos, expectNoCrash, trackUncaughtErrors } from './utils/chaos';
 
 /**
- * Network chaos suite.
+ * Deterministic chaos suite.
  *
- * Verifies the UI degrades gracefully when the network does not: slow APIs
- * must show loading states, failing APIs must show an error with a way to
- * retry, and nothing may escape to an unhandled crash or a blank screen.
+ * All faults are seeded and all waits are driven by explicit conditions
+ * (visible text, roles, or intercepted-request counters) rather than wall
+ * clock sleeps, so runs are repeatable across machines and CI shards.
  *
- * Faults are seeded; set CHAOS_SEED to replay a failing randomised run.
+ * Operational edge cases covered:
+ *  - high latency: loading state must render before content resolves
+ *  - HTTP 5xx: error alert with a retry affordance that recovers
+ *  - dropped packets: transport failure surfaces as a retryable error
+ *  - stale reads: a retry after recovery must not serve a cached failure
+ *  - restarts: reloading mid-flight must not crash or blank the page
+ *
+ * Failure modes / recovery:
+ *  - If a route renders a blank page or throws, expectNoCrash fails the test.
+ *  - If chaos injection leaks past a test, the fixture disables it on teardown.
+ *  - Rollback: remove this spec (and e2e/utils/chaos.ts) to restore prior CI.
+ *
+ * Replay a failing randomised run with CHAOS_SEED=&lt;seed&gt;.
  */
 
-const BUG_REPORTS_API = /\/api\/bug-reports/;
+const BOG_REPORTS_API = /\/api\/bug-reports/;
 const OPERATIONS_API = /\/api\/operational-health/;
 
 test.describe('network chaos: targeted scenarios', () => {
   test('high latency shows the loading state, then the content', async ({ page }) => {
     const uncaught = trackUncaughtErrors(page);
-    const chaos = await enableNetworkChaos(page, { urlPattern: BUG_REPORTS_API, latencyMs: [2500, 3000], seed: 1 });
+    const chaos = await enableNetworkChaos(page, { urlPattern: BOG_REPORTS_API, latencyMs: [2500, 3000], seed: 1 });
 
     await page.goto('/bug-reports', { waitUntil: 'domcontentloaded' });
     await expect(page.getByText('Loading bug reports...')).toBeVisible();
@@ -30,7 +42,7 @@ test.describe('network chaos: targeted scenarios', () => {
   test('HTTP 5xx shows an error with a retry button that recovers', async ({ page }) => {
     const uncaught = trackUncaughtErrors(page);
     const chaos = await enableNetworkChaos(page, {
-      urlPattern: BUG_REPORTS_API,
+      urlPattern: BOG_REPORTS_API,
       latencyMs: [500, 800],
       errorRate: 1,
       seed: 2,
@@ -43,8 +55,10 @@ test.describe('network chaos: targeted scenarios', () => {
     await expectNoCrash(page, uncaught, '/bug-reports under 5xx');
 
     await chaos.disable();
-    await alert.getByRole('button', { name: /retry/i }).click();
+    await alert.getBuRole('button', { name: /retry/i }).click();
     await expect(page.getByRole('heading', { name: /bug reports dashboard/i })).toBeVisible({ timeout: 15_000 });
+    // Stale-read guard: the recovered render must not replay the cached 5xx.
+    await expect(alert).toBeHidden();
     await expectNoCrash(page, uncaught, '/bug-reports after retry');
   });
 
@@ -61,7 +75,20 @@ test.describe('network chaos: targeted scenarios', () => {
     await chaos.disable();
     await alert.getByRole('button', { name: /retry/i }).click();
     await expect(page.getByText('Unresolved exceptions')).toBeVisible({ timeout: 15_000 });
+    await expect(alert).toBeHidden();
     await expectNoCrash(page, uncaught, '/dashboard/operations after retry');
+  });
+
+  test('reload mid-flight (restart) does not crash or blank the page', async ({ page }) => {
+    const uncaught = trackUncaughtErrors(page);
+    const chaos = await enableNetworkChaos(page, { urlPattern: BOG_REPORTS_API, latencyMs: [1500, 2500], seed: 5 });
+
+    await page.goto('/bug-reports', { waitUntil: 'domcontentloaded' });
+    // Restart the document while the delayed API request is still in flight.
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await expect(page.getByRole('heading', { name: /bug reports dashboard/i })).toBeVisible({ timeout: 15_000 });
+    expect(chaos.stats.intercepted).toBeGreaterThan(0);
+    await expectNoCrash(page, uncaught, '/bug-reports after mid-flight reload');
   });
 
   test('slow operations API shows the loading state', async ({ page }) => {
@@ -110,8 +137,12 @@ test.describe('network chaos: randomised route sweep', () => {
       const response = await page.goto(route, { waitUntil: 'domcontentloaded' });
       expect(response?.status() ?? 0, `${route} document request`).toBeLessThan(500);
 
-      // Let every in-flight (delayed / failing) API request settle.
-      await page.waitForLoadState('networkidle', { timeout: 25_000 }).catch(() => undefined);
+      // Deterministic settle: wait for the document to finish loading, then
+      // for the chaos layer to report no in-flight intercepted requests.
+      await page.waitForLoadState('load', { timeout: 25_000 }).catch(() => undefined);
+      await expect
+        .poll(() => chaos.stats.inFlight, { timeout: 25_000, message: `${route} in-flight requests` })
+        .toBe(0);
 
       test.info().annotations.push({
         type: 'chaos',

@@ -4,6 +4,7 @@ import { resolve } from 'node:path';
 import { normalizeDataset } from '../../lib/invariant-monitor/dataset';
 import { evaluateInvariant, failingResults, runInvariantMonitor } from '../../lib/invariant-monitor/monitor';
 import { renderJsonReport, renderTextReport } from '../../lib/invariant-monitor/report';
+import { buildAlertPayloads, dispatchAlerts, type AlertChannel } from '../../lib/invariant-monitor/report';
 import { ALL_INVARIANTS, DOMAIN_ID_PREFIX } from '../../lib/invariant-monitor/registry';
 import {
   INVARIANT_DOMAINS,
@@ -238,6 +239,52 @@ describe('Trellis Invariant Monitor', () => {
           expect(violation.severity).toBe(declared);
         }
       }
+    });
+  });
+
+  describe('Webhook alert dispatch', () => {
+    const report = runInvariantMonitor(loadFixture('corrupted-dataset.json'));
+
+    it('builds an immediate alert payload for critical violations', () => {
+      const payloads = buildAlertPayloads(report, { threshold: 'critical' });
+      expect(payloads.length).toBeGreaterThan(0);
+      for (const payload of payloads) {
+        expect(payload.severity).toBe('critical');
+        expect(payload.title).toContain('Invariant');
+        expect(payload.body).toContain('FUNDS');
+      }
+    });
+
+    it('includes violation diff context and affected record ids', () => {
+      const payloads = buildAlertPayloads(report, { threshold: 'critical' });
+      const funds = payloads.find((payload) => payload.invariantId === 'FUNDS-003');
+      expect(funds).toBeDefined();
+      expect(funds?.affectedRecordIds).toEqual(expect.arrayContaining(['pay-c2', 'pay-c3', 'pay-c4']));
+      expect(funds?.diffContext).toBeTruthy();
+    });
+
+    it('batches minor warnings instead of alerting immediately', () => {
+      const payloads = buildAlertPayloads(report, { threshold: 'critical' });
+      for (const payload of payloads) {
+        expect(isSeverityAtLeast(payload.severity, 'critical')).toBe(true);
+      }
+    });
+
+    it('dispatches payloads to configured webhook channels', async () => {
+      const sent: any[] = [];
+      const channels: AlertChannel[] = [
+        {
+          name: 'slack',
+          kind: 'slack',
+          url: 'https://hooks.slack.com/services/test',
+          send: async (payload) => {
+            sent.push(payload);
+          },
+        },
+      ];
+      const result = await dispatchAlerts(report, { threshold: 'critical', channels });
+      expect(result.dispatched).toBeGreaterThan(0);
+      expect(sent.length).toBe(result.dispatched);
     });
   });
 

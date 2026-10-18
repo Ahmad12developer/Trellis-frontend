@@ -21,6 +21,8 @@ export interface FilterState {
 interface Cursor {
   createdAt: string;
   id: string;
+  /** Prevent reusing a boundary with a different filter or visibility scope. */
+  filterScope?: string;
 }
 
 function encodeCursor(cursor: Cursor): string {
@@ -31,7 +33,11 @@ function decodeCursor(value: string | null): Cursor | null {
   if (!value) return null;
   try {
     const cursor = JSON.parse(Buffer.from(value, "base64url").toString("utf8"));
-    if (typeof cursor.createdAt !== "string" || typeof cursor.id !== "string") {
+    if (
+      typeof cursor.createdAt !== "string" ||
+      typeof cursor.id !== "string" ||
+      (cursor.filterScope !== undefined && typeof cursor.filterScope !== "string")
+    ) {
       return null;
     }
     return cursor;
@@ -65,9 +71,19 @@ export function paginateBugReports(
     author?: string;
     tag?: string | "all";
     buildVersion?: string | "all";
+    /** Stable server-side identity/permission revision, never a client value. */
+    visibilityScope?: string;
   } = {},
 ): BugReportPage {
   const limit = Math.min(Math.max(options.limit ?? 10, 1), 50);
+  const filterScope = JSON.stringify([
+    options.status ?? "all",
+    options.severity ?? "all",
+    options.author ?? "",
+    options.tag ?? "all",
+    options.buildVersion ?? "all",
+    options.visibilityScope ?? "",
+  ]);
   const filtered = [...reports]
     .filter((report) => !options.status || options.status === "all" || report.status === options.status)
     .filter((report) => !options.severity || options.severity === "all" || (report.priority as string) === options.severity)
@@ -84,25 +100,31 @@ export function paginateBugReports(
       return dateOrder || right.id.localeCompare(left.id);
     });
   const cursor = decodeCursor(options.cursor ?? null);
-  const start = cursor
+  const activeCursor = cursor?.filterScope && cursor.filterScope !== filterScope ? null : cursor;
+  const cursorIndex = activeCursor
     ? filtered.findIndex(
         (report) =>
-          report.createdAt < cursor.createdAt ||
-          (report.createdAt === cursor.createdAt && report.id < cursor.id),
+          report.createdAt < activeCursor.createdAt ||
+          (report.createdAt === activeCursor.createdAt && report.id < activeCursor.id),
       )
     : 0;
+  // A cursor can outlive every record below its boundary. `findIndex` then
+  // returns -1; treating that as slice(-1) would repeat the final record.
+  const start = cursorIndex < 0 ? filtered.length : cursorIndex;
   const records = filtered.slice(start, start + limit);
   const last = records.at(-1);
   const first = records[0];
   const hasMore = start + records.length < filtered.length;
   const hasPrevious = start > 0;
   const previousCursor = hasPrevious && first
-    ? encodeCursor({ createdAt: first.createdAt, id: first.id })
+    ? encodeCursor({ createdAt: first.createdAt, id: first.id, filterScope })
     : null;
 
   return {
     records,
-    nextCursor: hasMore && last ? encodeCursor({ createdAt: last.createdAt, id: last.id }) : null,
+    nextCursor: hasMore && last
+      ? encodeCursor({ createdAt: last.createdAt, id: last.id, filterScope })
+      : null,
     previousCursor,
     hasMore,
     hasPrevious,

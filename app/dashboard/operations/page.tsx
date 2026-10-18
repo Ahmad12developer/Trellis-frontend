@@ -25,16 +25,26 @@ import {
   type AlertMetric,
   type AlertRule,
   type ExceptionEvent,
+  type ExternalServiceHealth,
   type OperationalHealth,
   type OperationalMetricSample,
 } from '@/lib/operational-health';
+import {
+  buildExecutiveOperationalReport,
+  downloadOperationalMetricsCsv,
+  downloadOperationalReportPdf,
+} from '@/features/analytics/operational-report';
 import {
   DUPLICATE_RATE_WARNING_THRESHOLD,
   buildIdempotencyRateSeries,
   duplicateRequestRate,
 } from '@/lib/idempotency';
+import type { DependencyFallbackGuidance } from '@/lib/dependency-degradation';
+import { buildDependencyFallbacks } from '@/lib/dependency-degradation';
 import { useApiMetricsStore } from '@/store/apiMetricsStore';
 import { DeadLetterPanel } from './DeadLetterPanel';
+import { SideEffectDeadLetterPanel } from './SideEffectDeadLetterPanel';
+import CacheManager, { type CacheDiagnostic } from '@/lib/cache-manager';
 
 const MINUTE_MS = 60 * 1000;
 
@@ -61,7 +71,11 @@ type FilterState = {
   release: string;
 };
 
-type HealthResponse = OperationalHealth & { exceptions?: ExceptionEvent[] };
+type HealthResponse = OperationalHealth & {
+  exceptions?: ExceptionEvent[];
+  externalServices?: ExternalServiceHealth[];
+  dependencyFallbacks?: DependencyFallbackGuidance[];
+};
 
 function uniqueValues(events: readonly ExceptionEvent[], key: keyof FilterState): string[] {
   return Array.from(new Set(events.map((event) => event[key]))).sort((a, b) => a.localeCompare(b));
@@ -78,6 +92,9 @@ function groupLabel(dimension: string): string {
 
 export default function OperationsDashboardPage() {
   const [health, setHealth] = useState<OperationalHealth | null>(null);
+  const [externalServices, setExternalServices] = useState<ExternalServiceHealth[]>([]);
+  const [dependencyFallbacks, setDependencyFallbacks] = useState<DependencyFallbackGuidance[]>([]);
+  const [exportStatusMessage, setExportStatusMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [mounted, setMounted] = useState(false);
   const [now, setNow] = useState<number | null>(null);
@@ -97,6 +114,9 @@ export default function OperationsDashboardPage() {
   const [ruleError, setRuleError] = useState<string | null>(null);
   const [metricSamples, setMetricSamples] = useState<OperationalMetricSample[]>([]);
   const [metricConnection, setMetricConnection] = useState<MetricConnectionStatus>('connecting');
+  const [cacheDiagnostics, setCacheDiagnostics] = useState<CacheDiagnostic[] | null>(null);
+  const [cacheRepairing, setCacheRepairing] = useState(false);
+  const [cacheRepairMessage, setCacheRepairMessage] = useState<string | null>(null);
 
   const exceptionEvents = useApiMetricsStore((state) => state.exceptionEvents);
   const alertRules = useApiMetricsStore((state) => state.alertRules);
@@ -117,6 +137,28 @@ export default function OperationsDashboardPage() {
 
   useEffect(() => {
     let cancelled = false;
+    CacheManager.getInstance().diagnoseCaches()
+      .then((diagnostics) => { if (!cancelled) setCacheDiagnostics(diagnostics); })
+      .catch(() => { if (!cancelled) setCacheDiagnostics([]); });
+    return () => { cancelled = true; };
+  }, []);
+
+  const repairStaleCaches = async () => {
+    setCacheRepairing(true);
+    setCacheRepairMessage(null);
+    try {
+      const removed = await CacheManager.getInstance().repairStaleCacheEntries();
+      setCacheRepairMessage(`${removed} stale cache ${removed === 1 ? 'entry' : 'entries'} removed from this browser.`);
+      setCacheDiagnostics(await CacheManager.getInstance().diagnoseCaches());
+    } catch {
+      setCacheRepairMessage('Cache repair could not complete in this browser.');
+    } finally {
+      setCacheRepairing(false);
+    }
+  };
+
+  useEffect(() => {
+    let cancelled = false;
     const query = new URLSearchParams({ windowMinutes: String(windowMinutes) });
     fetch(`/api/operational-health?${query.toString()}`)
       .then((response) => {
@@ -128,6 +170,10 @@ export default function OperationsDashboardPage() {
         setHealth(data);
         setError(null);
         if (Array.isArray(data.exceptions)) setExceptionEvents(data.exceptions);
+        if (Array.isArray(data.externalServices)) setExternalServices(data.externalServices);
+        setDependencyFallbacks(Array.isArray(data.dependencyFallbacks)
+          ? data.dependencyFallbacks
+          : buildDependencyFallbacks(data.externalServices ?? []));
       })
       .catch((requestError: Error) => {
         if (!cancelled) setError(requestError.message);
@@ -239,6 +285,31 @@ export default function OperationsDashboardPage() {
     });
   }, [now, exceptionEvents, windowMinutes, activeFilters, alertRules]);
 
+  const executiveReport = useMemo(() => {
+    const referenceNow = now ?? Date.now();
+    return buildExecutiveOperationalReport({
+      now: referenceNow,
+      windowMinutes,
+      health,
+      exceptionEvents,
+      trendReport: report,
+      metricSamples,
+      externalServices,
+      filters: activeFilters,
+      rules: alertRules,
+    });
+  }, [now, windowMinutes, health, exceptionEvents, report, metricSamples, externalServices, activeFilters, alertRules]);
+
+  const handleExportPdf = () => {
+    downloadOperationalReportPdf(executiveReport);
+    setExportStatusMessage('Executive PDF operational report generated and downloaded.');
+  };
+
+  const handleExportCsv = () => {
+    downloadOperationalMetricsCsv(metricSamples, report?.buckets ?? []);
+    setExportStatusMessage('Raw time-series operational metrics exported as CSV.');
+  };
+
   const chartData = useMemo(
     () =>
       report?.buckets.map((bucket) => ({
@@ -293,15 +364,130 @@ export default function OperationsDashboardPage() {
   return (
     <main className="min-h-screen px-4 py-12 text-white sm:px-6 lg:px-8">
       <div className="mx-auto max-w-6xl">
-        <header className="mb-10">
-          <p className="text-sm font-semibold uppercase tracking-[0.2em] text-trellis-leaf">
-            Maintainer operations
-          </p>
-          <h1 className="mt-3 text-4xl font-bold">Operational health</h1>
-          <p className="mt-3 max-w-2xl text-gray-300">
-            A redacted view of unresolved work, stale records, reconciliation drift, and user-impacting incidents.
-          </p>
+        <header className="mb-10 flex flex-wrap items-start justify-between gap-4">
+          <div>
+            <p className="text-sm font-semibold uppercase tracking-[0.2em] text-trellis-leaf">
+              Maintainer operations
+            </p>
+            <h1 className="mt-3 text-4xl font-bold">Operational health</h1>
+            <p className="mt-3 max-w-2xl text-gray-300">
+              A redacted view of unresolved work, stale records, reconciliation drift, and user-impacting incidents.
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center gap-3">
+            <button
+              type="button"
+              onClick={handleExportPdf}
+              data-testid="export-pdf-report-btn"
+              className="rounded-md bg-trellis-leaf px-4 py-2 text-sm font-semibold text-black focus:outline-none focus:ring-2 focus:ring-trellis-leaf"
+            >
+              Export PDF Report
+            </button>
+            <button
+              type="button"
+              onClick={handleExportCsv}
+              data-testid="export-metrics-csv-btn"
+              className="rounded-md border border-trellis-leaf px-4 py-2 text-sm font-semibold text-trellis-leaf focus:outline-none focus:ring-2 focus:ring-trellis-leaf"
+            >
+              Export CSV
+            </button>
+          </div>
         </header>
+
+        {exportStatusMessage && (
+          <p role="status" aria-live="polite" className="mb-6 rounded-md border border-trellis-leaf/40 bg-trellis-vine/20 p-3 text-sm text-green-200">
+            {exportStatusMessage}
+          </p>
+        )}
+
+        <section aria-labelledby="executive-report-heading" className="mb-10 rounded-lg border border-trellis-vine/30 bg-trellis-vine/10 p-5" data-testid="executive-report-summary">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h2 id="executive-report-heading" className="text-2xl font-bold">Executive operational summary</h2>
+              <p className="mt-1 text-sm text-gray-400">
+                Aggregated uptime SLA posture, error velocity, and top failing routes for governance and monthly reliability reviews.
+              </p>
+            </div>
+            <span
+              className={`rounded-full px-3 py-1 text-xs font-bold uppercase ${
+                executiveReport.uptime.slaMet
+                  ? 'bg-green-500/20 text-green-300'
+                  : 'bg-red-500/20 text-red-300'
+              }`}
+            >
+              {executiveReport.uptime.slaMet ? 'SLA Passing' : 'SLA Attention'}
+            </span>
+          </div>
+
+          <dl className="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+            <div className="rounded border border-white/10 bg-black/10 p-3">
+              <dt className="text-xs uppercase tracking-wide text-gray-400">Overall Uptime</dt>
+              <dd className="mt-1 text-2xl font-bold text-white">
+                {executiveReport.uptime.overallUptimePercentage.toFixed(1)}%
+              </dd>
+              <p className="mt-1 text-xs text-gray-400">
+                Target: {executiveReport.uptime.slaTargetPercentage.toFixed(1)}%
+              </p>
+            </div>
+            <div className="rounded border border-white/10 bg-black/10 p-3">
+              <dt className="text-xs uppercase tracking-wide text-gray-400">Error Trend ({executiveReport.windowMinutes}m)</dt>
+              <dd className="mt-1 text-2xl font-bold capitalize text-white">
+                {executiveReport.errorTrends.trendDirection}
+              </dd>
+              <p className="mt-1 text-xs text-gray-400">
+                {executiveReport.errorTrends.avgErrorsPerMinute.toFixed(2)} avg / {executiveReport.errorTrends.peakErrorsPerMinute.toFixed(2)} peak per min
+              </p>
+            </div>
+            <div className="rounded border border-white/10 bg-black/10 p-3">
+              <dt className="text-xs uppercase tracking-wide text-gray-400">Critical / RPC Errors</dt>
+              <dd className="mt-1 text-2xl font-bold text-white">
+                {executiveReport.errorTrends.criticalExceptions} / {executiveReport.errorTrends.rpcExceptions}
+              </dd>
+              <p className="mt-1 text-xs text-gray-400">
+                {executiveReport.errorTrends.totalExceptions} total window exceptions
+              </p>
+            </div>
+            <div className="rounded border border-white/10 bg-black/10 p-3">
+              <dt className="text-xs uppercase tracking-wide text-gray-400">Top Failing Routes</dt>
+              <dd className="mt-1 text-2xl font-bold text-white">
+                {executiveReport.topFailingRoutes.length}
+              </dd>
+              <p className="mt-1 text-xs text-gray-400">
+                {executiveReport.topFailingRoutes[0]
+                  ? `Highest: ${executiveReport.topFailingRoutes[0].route} (${executiveReport.topFailingRoutes[0].failureCount})`
+                  : 'No route failures recorded'}
+              </p>
+            </div>
+          </dl>
+
+          {executiveReport.topFailingRoutes.length > 0 && (
+            <div className="mt-4 overflow-x-auto">
+              <h3 className="mb-2 text-sm font-semibold text-gray-200">Top failing routes</h3>
+              <table className="min-w-full divide-y divide-trellis-vine/20 text-left text-sm" aria-label="Top failing routes">
+                <thead>
+                  <tr className="text-gray-400">
+                    <th scope="col" className="py-2 pr-4 font-semibold">Route</th>
+                    <th scope="col" className="py-2 pr-4 font-semibold">Failures</th>
+                    <th scope="col" className="py-2 pr-4 font-semibold">Critical</th>
+                    <th scope="col" className="py-2 pr-4 font-semibold">Share</th>
+                    <th scope="col" className="py-2 font-semibold">Dominant Kind</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-trellis-vine/10">
+                  {executiveReport.topFailingRoutes.map((routeStat) => (
+                    <tr key={routeStat.route} className="text-gray-300">
+                      <td className="py-2 pr-4 font-mono text-xs text-trellis-leaf">{routeStat.route}</td>
+                      <td className="py-2 pr-4 font-semibold text-white">{routeStat.failureCount}</td>
+                      <td className="py-2 pr-4">{routeStat.criticalCount}</td>
+                      <td className="py-2 pr-4">{routeStat.errorRatePct.toFixed(1)}%</td>
+                      <td className="py-2 uppercase text-xs">{routeStat.dominantKind}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </section>
 
         <section aria-labelledby="performance-heading" className="mb-10">
           <div className="flex flex-wrap items-center justify-between gap-3">
@@ -375,6 +561,33 @@ export default function OperationsDashboardPage() {
           </div>
         </section>
 
+        <section aria-labelledby="cache-diagnostics-heading" className="mb-10 rounded-lg border border-trellis-vine/30 bg-trellis-vine/10 p-5">
+          <div className="flex flex-wrap items-start justify-between gap-4">
+            <div>
+              <h2 id="cache-diagnostics-heading" className="text-2xl font-bold">Cache freshness</h2>
+              <p className="mt-1 max-w-3xl text-sm text-gray-400">
+                Evidence covers Cache Storage in this browser only. URLs and cached values are not displayed; this does not measure remote users or the search index.
+              </p>
+            </div>
+            <button type="button" onClick={repairStaleCaches} disabled={cacheRepairing || !cacheDiagnostics?.some((item) => item.staleEntries > 0)} className="rounded border border-trellis-leaf px-3 py-2 text-sm font-semibold text-trellis-leaf disabled:cursor-not-allowed disabled:opacity-50">
+              {cacheRepairing ? 'Removing stale entries…' : 'Remove stale entries'}
+            </button>
+          </div>
+          {cacheDiagnostics === null ? <p className="mt-4 text-sm text-gray-300" role="status">Inspecting local caches…</p> : (
+            <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+              {cacheDiagnostics.map((item) => (
+                <article key={item.type} className="rounded border border-white/10 bg-black/10 p-3">
+                  <h3 className="font-semibold">{item.type}</h3>
+                  <p className="mt-2 text-sm text-gray-300">{item.staleEntries} stale / {item.entries} entries</p>
+                  <p className="text-sm text-gray-400">{item.entriesWithoutTimestamp} without freshness evidence</p>
+                  <p className="mt-2 text-xs text-gray-400">{item.recommendation}</p>
+                </article>
+              ))}
+            </div>
+          )}
+          {cacheRepairMessage && <p className="mt-3 text-sm text-gray-300" role="status">{cacheRepairMessage}</p>}
+        </section>
+
         {error && <p role="alert" className="rounded-lg border border-red-500/50 bg-red-500/10 p-4 text-red-200">{error}</p>}
         {!health && !error && <p aria-live="polite" className="text-gray-300">Loading operational health...</p>}
 
@@ -402,6 +615,39 @@ export default function OperationsDashboardPage() {
             </p>
           </>
         )}
+
+        <section aria-labelledby="dependency-fallbacks-heading" className="mt-10 rounded-lg border border-trellis-vine/30 bg-trellis-vine/10 p-5" data-testid="dependency-fallbacks">
+          <div className="flex flex-wrap items-start justify-between gap-4">
+            <div>
+              <h2 id="dependency-fallbacks-heading" className="text-2xl font-bold">External dependency status</h2>
+              <p className="mt-1 max-w-3xl text-sm text-gray-400">
+                Safe user messaging and operator recovery guidance when a provider is degraded. Provider URLs and raw probe errors are not shown.
+              </p>
+            </div>
+            <span className="text-sm text-gray-400" role="status" aria-live="polite">
+              {externalServices.filter((service) => service.status === 'healthy').length} of {externalServices.length} healthy
+            </span>
+          </div>
+          {dependencyFallbacks.length === 0 ? (
+            <p className="mt-4 rounded border border-green-500/30 bg-green-500/10 p-3 text-sm text-green-200">
+              All monitored external dependencies are healthy.
+            </p>
+          ) : (
+            <ul className="mt-4 grid gap-3 md:grid-cols-2">
+              {dependencyFallbacks.map((guidance) => (
+                <li key={guidance.service} className="rounded border border-yellow-500/40 bg-yellow-500/10 p-4">
+                  <div className="flex items-center justify-between gap-3">
+                    <h3 className="font-semibold text-white">{guidance.label}</h3>
+                    <span className="rounded-full bg-yellow-500/20 px-2 py-1 text-xs font-bold uppercase text-yellow-200">{guidance.status}</span>
+                  </div>
+                  <p className="mt-3 text-sm text-gray-200">{guidance.userMessage}</p>
+                  <p className="mt-3 text-sm text-gray-300"><span className="font-semibold text-white">User fallback:</span> {guidance.fallback}</p>
+                  <p className="mt-2 text-sm text-gray-400"><span className="font-semibold text-gray-200">Recovery:</span> {guidance.recovery}</p>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
 
         {report && report.breaches.length > 0 && (
           <section role="alert" aria-live="assertive" aria-labelledby="breach-heading" className="mt-10 space-y-3">
@@ -772,7 +1018,10 @@ export default function OperationsDashboardPage() {
           </div>
         </section>
       </div>
-        <div className="mx-auto max-w-6xl"><DeadLetterPanel /></div>
+        <div className="mx-auto max-w-6xl space-y-8">
+          <DeadLetterPanel />
+          <SideEffectDeadLetterPanel />
+        </div>
     </main>
   );
 }

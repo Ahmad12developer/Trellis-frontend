@@ -91,3 +91,40 @@ export async function pollTransactionStatus(
 
     return { status: "TIMEOUT", error: "Transaction polling timed out" };
 }
+
+/**
+ * Submits an aggregated multi-signature transaction to Soroban RPC once threshold signatures are met
+ */
+export async function submitMultisigTransaction(
+    envelopeXdr: string,
+    networkName: string = "TESTNET"
+): Promise<{ success: boolean; hash?: string; error?: string }> {
+    try {
+        const netKey = (networkName.toUpperCase() in STELLAR_NETWORKS)
+            ? networkName.toUpperCase() as keyof typeof STELLAR_NETWORKS
+            : "TESTNET";
+        const networkConfig = STELLAR_NETWORKS[netKey];
+        const rpcUrl = networkConfig.rpcUrl || networkConfig.horizonUrl.replace("horizon", "soroban-rpc");
+        const server = new (StellarSdk as any).rpc.Server(rpcUrl);
+        const tx = StellarSdk.TransactionBuilder.fromXDR(envelopeXdr, networkConfig.networkPassphrase);
+        const sendResponse = await server.sendTransaction(tx);
+        if (sendResponse.status === "ERROR") {
+            return {
+                success: false,
+                error: (sendResponse as any).errorResult?.message || "Failed to submit transaction to Soroban RPC",
+            };
+        }
+        if (sendResponse.hash) {
+            const waitResult = await pollTransactionStatus(server, sendResponse.hash);
+            return {
+                success: waitResult.status === "SUCCESS",
+                hash: sendResponse.hash,
+                error: waitResult.error,
+            };
+        }
+        return { success: false, error: "No transaction hash returned" };
+    } catch (e: any) {
+        return { success: false, error: e.message || "Failed to submit multisig transaction" };
+    }
+}
+

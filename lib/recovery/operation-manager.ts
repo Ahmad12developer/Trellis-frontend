@@ -31,6 +31,10 @@ import type {
   CheckpointStore,
 } from './types';
 import { getCheckpointStore } from './checkpoint-store';
+import {
+  validateOperationTransition,
+  validateStepTransition,
+} from './state-machine';
 
 // ─── Defaults ─────────────────────────────────────────────────────────────────
 
@@ -363,12 +367,31 @@ export class OperationManager {
     };
   }
 
+  // ─── Lifecycle transition operations ────────────────────────────────────────
+
+  /**
+   * Explicitly transition an operation to terminal failed status.
+   * Legal from `paused` or `abandoned` states.
+   */
+  abortOperation(operationId: string, reason?: string): RecoverableOperation {
+    const op = this.store.getOperation(operationId);
+    if (!op) throw new Error(`Operation ${operationId} not found`);
+    return this._updateOp(op, {
+      status: 'failed',
+      finishedAt: nowIso(),
+      context: { ...op.context, abortReason: reason },
+    });
+  }
+
   // ─── Mutation helpers ────────────────────────────────────────────────────────
 
   private _updateOp(
     op: RecoverableOperation,
     patch: Partial<RecoverableOperation>,
   ): RecoverableOperation {
+    if (patch.status && patch.status !== op.status) {
+      validateOperationTransition(op, patch.status);
+    }
     const updated: RecoverableOperation = { ...op, ...patch, updatedAt: nowIso() };
     this.store.saveOperation(updated);
     return updated;
@@ -379,6 +402,10 @@ export class OperationManager {
     index: number,
     patch: Partial<OperationStep>,
   ): RecoverableOperation {
+    const targetStep = op.steps[index];
+    if (patch.status && targetStep && patch.status !== targetStep.status) {
+      validateStepTransition(targetStep, patch.status);
+    }
     const steps = op.steps.map((s, i) =>
       i === index ? { ...s, ...patch } : s,
     );

@@ -1,5 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
+import { requirePermission } from '@/lib/auth/guard';
+import { streamingExport, type ExportRequest as StreamingExportRequest, type RecordFetcher, type PermissionRecord } from '@/lib/export/streaming-export';
 
 /**
  * #36 — Data export endpoint.
@@ -15,6 +17,12 @@ import { z } from 'zod';
  *
  * Schema versioning: every export response includes a `schemaVersion` field
  * so downstream consumers can handle future field additions gracefully.
+ *
+ * #251 — Permission-aware streaming export pipeline:
+ * - Enforces caller permissions using the centralized permission matrix
+ * - Streams data in batches to bound memory usage
+ * - Supports cancellation via AbortController
+ * - Performs field-level permission checks and redaction
  */
 
 // ── Schema ────────────────────────────────────────────────────────────────────
@@ -77,38 +85,110 @@ function enforceDateRange(
 
 // ── Data fetchers (stubs — replace with real DB calls) ────────────────────────
 
-async function fetchSimulations(wallet: string, from: Date, to: Date) {
+/**
+ * Fetch simulation records in batches.
+ *
+ * TODO: Replace with real DB query:
+ * SELECT * FROM simulations
+ * WHERE wallet = $1 AND created_at BETWEEN $2 AND $3
+ * ORDER BY created_at
+ * LIMIT $4 OFFSET $5
+ */
+async function fetchSimulations(
+  wallet: string,
+  from: Date,
+  to: Date,
+  offset: number,
+  limit: number,
+  signal: AbortSignal,
+): Promise<PermissionRecord[]> {
+  // Check for cancellation
+  if (signal.aborted) {
+    return [];
+  }
+
   // TODO: query DB — filter by wallet, created_at BETWEEN from AND to
-  return { wallet, from: from.toISOString(), to: to.toISOString(), records: [] };
+  // For now, return empty array as stub
+  return [];
 }
 
-async function fetchAnalytics(from: Date, to: Date) {
+/**
+ * Fetch analytics records in batches.
+ *
+ * TODO: Replace with real DB query:
+ * SELECT * FROM analytics
+ * WHERE date BETWEEN $1 AND $2
+ * ORDER BY date
+ * LIMIT $3 OFFSET $4
+ */
+async function fetchAnalytics(
+  from: Date,
+  to: Date,
+  offset: number,
+  limit: number,
+  signal: AbortSignal,
+): Promise<PermissionRecord[]> {
+  // Check for cancellation
+  if (signal.aborted) {
+    return [];
+  }
+
   // Aggregate-only export; no wallet PII in output.
-  return { from: from.toISOString(), to: to.toISOString(), records: [] };
+  // TODO: query DB
+  return [];
 }
 
-async function fetchTelemetry(from: Date, to: Date) {
+/**
+ * Fetch telemetry records in batches.
+ *
+ * TODO: Replace with real DB query:
+ * SELECT * FROM telemetry
+ * WHERE timestamp BETWEEN $1 AND $2
+ * ORDER BY timestamp
+ * LIMIT $3 OFFSET $4
+ */
+async function fetchTelemetry(
+  from: Date,
+  to: Date,
+  offset: number,
+  limit: number,
+  signal: AbortSignal,
+): Promise<PermissionRecord[]> {
+  // Check for cancellation
+  if (signal.aborted) {
+    return [];
+  }
+
   // Anonymised events only — wallet column is intentionally excluded.
-  return { from: from.toISOString(), to: to.toISOString(), records: [] };
+  // TODO: query DB
+  return [];
 }
 
-async function fetchAffiliates(wallet: string, from: Date, to: Date) {
+/**
+ * Fetch affiliate records in batches.
+ *
+ * TODO: Replace with real DB query:
+ * SELECT * FROM affiliates
+ * WHERE wallet = $1 AND created_at BETWEEN $2 AND $3
+ * ORDER BY created_at
+ * LIMIT $4 OFFSET $5
+ */
+async function fetchAffiliates(
+  wallet: string,
+  from: Date,
+  to: Date,
+  offset: number,
+  limit: number,
+  signal: AbortSignal,
+): Promise<PermissionRecord[]> {
+  // Check for cancellation
+  if (signal.aborted) {
+    return [];
+  }
+
   // Scoped to the requesting wallet's affiliate program.
-  return { wallet, from: from.toISOString(), to: to.toISOString(), records: [] };
-}
-
-// ── CSV serialiser ────────────────────────────────────────────────────────────
-
-function toCsv(payload: object): string {
-  const records = (payload as { records: object[] }).records;
-  if (!records || records.length === 0) return 'no records\n';
-  const headers = Object.keys(records[0]).join(',');
-  const rows = records.map((r) =>
-    Object.values(r)
-      .map((v) => JSON.stringify(v ?? ''))
-      .join(','),
-  );
-  return [headers, ...rows].join('\n');
+  // TODO: query DB
+  return [];
 }
 
 // ── Route handler ─────────────────────────────────────────────────────────────
@@ -117,6 +197,12 @@ function toCsv(payload: object): string {
  * POST /api/export
  *
  * Body: { wallet, type, from?, to?, format? }
+ *
+ * This endpoint now uses the permission-aware streaming export pipeline:
+ * - Validates permissions using requirePermission
+ * - Streams data in batches to bound memory
+ * - Supports cancellation via AbortController
+ * - Performs field-level redaction based on caller's role
  */
 export async function POST(request: NextRequest) {
   let body: unknown;
@@ -141,40 +227,88 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: dateRange.error }, { status: 422 });
   }
 
-  try {
-    let records: object;
+  // Check export_data permission
+  const authResult = await requirePermission(request, {
+    action: 'export_data',
+    resourceOwnerId: wallet,
+    resourceScope: 'own',
+  });
+
+  if (!authResult.ok) {
+    return authResult.response;
+  }
+
+  // Create AbortController for cancellation support
+  const controller = new AbortController();
+  const signal = controller.signal;
+
+  // Set up timeout to cancel if client disconnects
+  request.signal.addEventListener('abort', () => {
+    controller.abort();
+  });
+
+  // Build the streaming export request
+  const streamingRequest: StreamingExportRequest = {
+    wallet,
+    type,
+    from: dateRange.from.toISOString(),
+    to: dateRange.to.toISOString(),
+    format,
+    role: authResult.actor.role,
+    actorId: authResult.actor.id,
+  };
+
+  // Create a record fetcher for this export type
+  const fetcher: RecordFetcher = async (offset, limit, signal) => {
+    let records: PermissionRecord[];
     switch (type) {
       case 'simulations':
-        records = await fetchSimulations(wallet, dateRange.from, dateRange.to);
+        records = await fetchSimulations(wallet, dateRange.from, dateRange.to, offset, limit, signal);
         break;
       case 'analytics':
-        records = await fetchAnalytics(dateRange.from, dateRange.to);
+        records = await fetchAnalytics(dateRange.from, dateRange.to, offset, limit, signal);
         break;
       case 'telemetry':
-        records = await fetchTelemetry(dateRange.from, dateRange.to);
+        records = await fetchTelemetry(dateRange.from, dateRange.to, offset, limit, signal);
         break;
       case 'affiliates':
-        records = await fetchAffiliates(wallet, dateRange.from, dateRange.to);
+        records = await fetchAffiliates(wallet, dateRange.from, dateRange.to, offset, limit, signal);
         break;
     }
+    return records;
+  };
 
-    const schemaVersion = '1.0';
-    const payload = { schemaVersion, type, ...records };
+  // Create a ReadableStream for the response
+  const readable = new ReadableStream({
+    async start(controller) {
+      const encoder = new TextEncoder();
 
-    if (format === 'csv') {
-      const csv = toCsv(payload);
-      return new NextResponse(csv, {
-        status: 200,
-        headers: {
-          'Content-Type': 'text/csv',
-          'Content-Disposition': `attachment; filename="${type}-export.csv"`,
-        },
-      });
-    }
+      const streamWriter = async (chunk: string) => {
+        controller.enqueue(encoder.encode(chunk));
+      };
 
-    return NextResponse.json(payload, { status: 200 });
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : 'Unexpected error generating export.';
-    return NextResponse.json({ error: message }, { status: 500 });
-  }
+      try {
+        await streamingExport(
+          streamingRequest,
+          fetcher,
+          streamWriter,
+          signal,
+          { batchSize: 1000, debug: false },
+        );
+        controller.close();
+      } catch (error) {
+        console.error('Export error:', error);
+        controller.error(error);
+      }
+    },
+  });
+
+  // Return the streaming response
+  return new NextResponse(readable, {
+    status: 200,
+    headers: {
+      'Content-Type': format === 'csv' ? 'text/csv' : 'application/json',
+      'Content-Disposition': `attachment; filename="${type}-export.${format}"`,
+    },
+  });
 }

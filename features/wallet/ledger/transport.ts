@@ -106,11 +106,11 @@ export async function createLedgerTransport(
       throw new LedgerError(ledgerErrorMessage("unsupported"), { code: "unsupported" });
     }
 
-    const module = (await import("@ledgerhq/hw-transport-webhid")) as {
+    const hidModule = (await import("@ledgerhq/hw-transport-webhid")) as {
       default?: unknown;
       create?: unknown;
     };
-    const TransportWebHID = (module.default ?? module) as { create?: () => Promise<unknown> };
+    const TransportWebHID = (hidModule.default ?? hidModule) as { create?: () => Promise<unknown> };
     if (!TransportWebHID || typeof TransportWebHID.create !== "function") {
       throw new LedgerError(ledgerErrorMessage("unavailable"), { code: "unavailable" });
     }

@@ -14,9 +14,37 @@ import {
   subscribeToCachedValue,
 } from "@/lib/cache-manager";
 import { ApiError, RetryScheduler, type RetryPolicy } from "@/lib/retry";
+import {
+  CSRF_HEADER_NAME,
+  ensureCsrfToken,
+  getClientCsrfToken,
+  isCsrfProtectedMethod,
+  isValidCsrfTokenFormat,
+  verifyCsrfToken,
+} from "@/lib/security/csrf";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
 const REQUEST_CACHE_TTL_MS = 60_000;
+
+function normalizeHeaders(headers?: HeadersInit): Record<string, string> {
+  if (!headers) return {};
+  if (typeof Headers !== "undefined" && headers instanceof Headers) {
+    const record: Record<string, string> = {};
+    headers.forEach((value, key) => {
+      record[key] = value;
+    });
+    return record;
+  }
+  if (Array.isArray(headers)) {
+    return Object.fromEntries(headers);
+  }
+  return { ...(headers as Record<string, string>) };
+}
+
+function findHeaderKey(headers: Record<string, string>, target: string): string | undefined {
+  const lower = target.toLowerCase();
+  return Object.keys(headers).find((key) => key.toLowerCase() === lower);
+}
 
 /**
  * Reads an error body without letting a malformed payload mask the HTTP status.
@@ -75,11 +103,41 @@ export async function apiCall(
 
   const url = `${API_URL}${endpoint}`;
   const fetchData = async () => {
+    const callerHeaders = normalizeHeaders(options.headers);
+    const csrfKey = findHeaderKey(callerHeaders, CSRF_HEADER_NAME);
+
+    if (isCsrfProtectedMethod(method)) {
+      if (csrfKey !== undefined) {
+        const providedToken = callerHeaders[csrfKey];
+        const cookieToken = getClientCsrfToken();
+        const effectiveCookie =
+          cookieToken ?? (isValidCsrfTokenFormat(providedToken) ? providedToken : null);
+        const validation = verifyCsrfToken(providedToken, effectiveCookie);
+        if (!validation.valid) {
+          throw new ApiError(
+            `API error 403: ${validation.message || 'Forbidden'}`,
+            {
+              status: 403,
+              statusText: 'Forbidden',
+              body: { error: validation.message, code: validation.reason },
+              url,
+            },
+          );
+        }
+        if (csrfKey !== CSRF_HEADER_NAME) {
+          delete callerHeaders[csrfKey];
+        }
+        callerHeaders[CSRF_HEADER_NAME] = providedToken;
+      } else {
+        callerHeaders[CSRF_HEADER_NAME] = ensureCsrfToken();
+      }
+    }
+
     const response = await fetch(url, {
       ...options,
       headers: {
         'Content-Type': 'application/json',
-        ...options.headers,
+        ...callerHeaders,
       },
     });
 

@@ -346,3 +346,4 @@ export function calculateDelegatedVotingPower(
   return power;
 }
 
+export * from './multisig';

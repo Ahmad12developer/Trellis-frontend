@@ -11,7 +11,7 @@ import { expect, type Page, type Route } from '@playwright/test';
 
 export interface ChaosOptions {
   /** Requests to intercept. Defaults to the app's own API routes. */
-  urlPattern?: string | RegExp;
+  urlPattern: string | RegExp;
   /** Inclusive delay range in ms applied before every intercepted request. */
   latencyMs?: readonly [number, number];
   /** Probability (0-1) that a request is answered with a 5xx instead. */
@@ -40,7 +40,7 @@ export interface ChaosController {
 }
 
 export const DEFAULT_CHAOS_PATTERN = /\/api\//;
-export const DEFAULT_ERROR_STATUSES = [500, 502, 503, 504] as const;
+export const DEFAULT_ERROR_STATUSES: readonly number[] = [500, 502, 503, 504];
 
 /** mulberry32 — tiny, fast, good enough for fault injection. */
 export function createSeededRandom(seed: number): () => number {
@@ -59,7 +59,7 @@ export async function enableNetworkChaos(page: Page, options: ChaosOptions = {})
     urlPattern = DEFAULT_CHAOS_PATTERN,
     latencyMs = [0, 0],
     errorRate = 0,
-    errorStatuses = DEFAULT_ERROR_STATUSES,
+    errorStatuses = DEFAULT_ERROR_STATUSES as readonly number[],
     dropRate = 0,
     seed = Number(process.env.CHAOS_SEED ?? Date.now() % 1_000_000),
   } = options;

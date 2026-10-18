@@ -30,6 +30,8 @@ export interface IndexedRecord {
   id: string;
   visibility: 'public' | 'restricted' | 'hidden';
   visibleTo?: string[];
+  requiredRoles?: string[];
+  organizationId?: string;
   indexed_at: number;
   [key: string]: unknown;
 }
@@ -49,6 +51,47 @@ export interface RepairJob {
   recordsChecked: number;
   recordsFixed: number;
   errors: string[];
+  recommendations?: IndexRepairRecommendation[];
+}
+
+export interface IndexRepairRecommendation {
+  recordId: string;
+  evidence: 'missing-index-entry' | 'visibility-mismatch' | 'permission-scope-mismatch' | 'consistent';
+  action: 'create-or-update' | 'remove' | 'none';
+}
+
+/** Compare authoritative record permissions with the indexed snapshot. */
+export function recommendIndexRepair(
+  record: IndexableRecord,
+  permissions: PermissionConstraint,
+  indexedEntry?: IndexedRecord,
+): IndexRepairRecommendation {
+  const shouldIndex = shouldIndexRecord(record, permissions);
+  if (!indexedEntry) {
+    if (!shouldIndex) {
+      return { recordId: record.id, evidence: 'consistent', action: 'none' };
+    }
+    return {
+      recordId: record.id,
+      evidence: 'missing-index-entry',
+      action: shouldIndex ? 'create-or-update' : 'none',
+    };
+  }
+  if (!shouldIndex) {
+    return { recordId: record.id, evidence: 'visibility-mismatch', action: 'remove' };
+  }
+  const expectedVisibility = getRecordVisibility(record, permissions);
+  if (indexedEntry.visibility !== expectedVisibility) {
+    return { recordId: record.id, evidence: 'visibility-mismatch', action: 'create-or-update' };
+  }
+  if (
+    JSON.stringify(indexedEntry.visibleTo) !== JSON.stringify(permissions.visibleTo) ||
+    JSON.stringify(indexedEntry.requiredRoles) !== JSON.stringify(permissions.requiredRoles) ||
+    indexedEntry.organizationId !== permissions.organizationId
+  ) {
+    return { recordId: record.id, evidence: 'permission-scope-mismatch', action: 'create-or-update' };
+  }
+  return { recordId: record.id, evidence: 'consistent', action: 'none' };
 }
 
 /**
@@ -118,6 +161,8 @@ export function createIndexEntry(
     id: record.id,
     visibility,
     visibleTo: permissions.visibleTo,
+    requiredRoles: permissions.requiredRoles,
+    organizationId: permissions.organizationId,
     indexed_at: Date.now(),
     ...record,
     ...additionalMetadata,
@@ -193,7 +238,9 @@ export function isIndexConsistent(
   if (expectedShouldIndex) {
     return (
       indexedEntry.visibility === expectedVisibility &&
-      JSON.stringify(indexedEntry.visibleTo) === JSON.stringify(permissions.visibleTo)
+      JSON.stringify(indexedEntry.visibleTo) === JSON.stringify(permissions.visibleTo) &&
+      JSON.stringify(indexedEntry.requiredRoles) === JSON.stringify(permissions.requiredRoles) &&
+      indexedEntry.organizationId === permissions.organizationId
     );
   } else {
     // If record shouldn't be indexed, presence of entry is inconsistent
@@ -220,6 +267,7 @@ export class SearchIndexRepair {
       recordsChecked: 0,
       recordsFixed: 0,
       errors: [],
+      recommendations: [],
     };
   }
 
@@ -257,7 +305,9 @@ export class SearchIndexRepair {
         }
 
         // Check consistency
-        if (!isIndexConsistent(record, permissions, indexedEntry as IndexedRecord)) {
+        const recommendation = recommendIndexRepair(record, permissions, indexedEntry);
+        this.job.recommendations?.push(recommendation);
+        if (recommendation.action !== 'none') {
           await this.repairRecord(record, permissions, indexedEntry);
           this.job.recordsFixed++;
         }

@@ -8,20 +8,20 @@ interface SubmissionTableProps {
 
 export function SubmissionTable({ submissions }: SubmissionTableProps) {
   if (submissions.length === 0) {
-    return <p>No submissions available.</p>;
+    return <p role="status" aria-live="polite">No submissions available.</p>;
   }
 
   return (
     <div className="overflow-x-auto rounded border border-slate-200">
-      <table className="min-w-full divide-y divide-slate-200 text-left text-sm">
+      <table aria-label="Submissions" className="min-w-full divide-y divide-slate-200 text-left text-sm">
         <thead className="bg-slate-50">
           <tr>
-            <th className="px-3 py-2">ID</th>
-            <th className="px-3 py-2">Tx Hash</th>
-            <th className="px-3 py-2">Status</th>
-            <th className="px-3 py-2">Timestamp</th>
-            <th className="px-3 py-2">Security Score</th>
-            <th className="px-3 py-2">License Audit</th>
+            <th scope="col" className="px-3 py-2">ID</th>
+            <th scope="col" className="px-3 py-2">Tx Hash</th>
+            <th scope="col" className="px-3 py-2">Status</th>
+            <th scope="col" className="px-3 py-2">Timestamp</th>
+            <th scope="col" className="px-3 py-2">Security Score</th>
+            <th scope="col" className="px-3 py-2">License Audit</th>
           </tr>
         </thead>
         <tbody className="divide-y divide-slate-100 bg-white">

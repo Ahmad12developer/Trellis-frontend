@@ -139,9 +139,9 @@ export class TransformersEmbedder implements Embedder {
   }
 
   private async createPipeline(): Promise<FeatureExtractionPipeline> {
-    let module: TransformersModule;
+    let xenovaModule: TransformersModule;
     try {
-      module = await this.loadModule();
+      xenovaModule = await this.loadModule();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       throw new EmbeddingUnavailableError(
@@ -151,7 +151,7 @@ export class TransformersEmbedder implements Embedder {
     }
 
     try {
-      const env = module.env;
+      const env = xenovaModule.env;
       if (env) {
         // Fetch from the Hugging Face CDN and cache in the browser; never look
         // for a local model directory, which a client bundle does not have.
@@ -165,7 +165,7 @@ export class TransformersEmbedder implements Embedder {
         if (wasm) wasm.numThreads = this.numThreads;
       }
 
-      return await module.pipeline("feature-extraction", this.model, {
+      return await xenovaModule.pipeline("feature-extraction", this.model, {
         quantized: true,
       });
     } catch (error) {

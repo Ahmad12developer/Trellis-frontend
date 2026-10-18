@@ -765,3 +765,5 @@ export function groupNotificationsIntoThreads(
 
   return allItems;
 }
+export * from './notifications/durable-preferences';
+export * from './notifications/routing-model';

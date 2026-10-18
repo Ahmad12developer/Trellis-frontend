@@ -34,6 +34,7 @@ import NetworkSwitcher from "./NetworkSwitcher";
 import ThemeToggle from "./ThemeToggle";
 import LanguageSwitcher from "./LanguageSwitcher";
 import { useStellarWallet } from "./context/StellarWalletProvider";
+import useFocusTrap from "./useFocusTrap";
 
 export const Navigation: React.FC = () => {
   const [isDrawerOpen, setIsDrawerOpen] = useState(false);
@@ -72,6 +73,11 @@ export const Navigation: React.FC = () => {
     { href: "/submissions", label: "Submission Dashboard" },
     { href: "/settings/api-keys", label: "API Keys" },
   ];
+
+  const drawerTrapRef = useFocusTrap<HTMLDivElement>({
+    active: isDrawerOpen,
+    onEscape: () => setIsDrawerOpen(false),
+  });
 
   const toggleDrawer = (open: boolean) => (event: React.KeyboardEvent | React.MouseEvent) => {
     if (
@@ -160,14 +166,17 @@ export const Navigation: React.FC = () => {
         }}
       >
         <Box
+          ref={drawerTrapRef}
           sx={{ width: "auto", p: 2 }}
-          role="presentation"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Navigation drawer"
           onClick={toggleDrawer(false)}
           onKeyDown={toggleDrawer(false)}
         >
           <Box className="flex justify-between items-center mb-6">
             <span className="glow-text font-bold text-lg">Navigation</span>
-            <IconButton onClick={toggleDrawer(false)} sx={{ color: "white" }}>
+            <IconButton onClick={toggleDrawer(false)} sx={{ color: "white" }} aria-label="Close navigation drawer">
               <CloseIcon />
             </IconButton>
           </Box>

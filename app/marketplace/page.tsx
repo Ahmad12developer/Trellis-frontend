@@ -4,11 +4,13 @@ import { useState } from 'react';
 import { RecommendationCarousel } from '@/features/recommendations/components/RecommendationCarousel';
 import { useSemanticSearch } from '@/features/agent-discovery/hooks/useSemanticSearch';
 import type { AgentDocument } from '@/features/agent-discovery/semantic/types';
+import { useMarketplaceUrlState } from './useMarketplaceUrlState';
 
 type MarketplaceAgent = AgentDocument & {
   rating: number;
   users: number;
   icon: string;
+  categories: string[];
 };
 
 // Module-level so the reference is stable: `useSemanticSearch` re-indexes only
@@ -22,6 +24,7 @@ const AGENTS: MarketplaceAgent[] = [
     rating: 4.8,
     users: 1250,
     icon: '📊',
+    categories: ['ai', 'analytics'],
   },
   {
     id: 2,
@@ -31,6 +34,7 @@ const AGENTS: MarketplaceAgent[] = [
     rating: 4.6,
     users: 890,
     icon: '✍️',
+    categories: ['ai', 'writing'],
   },
   {
     id: 3,
@@ -40,6 +44,7 @@ const AGENTS: MarketplaceAgent[] = [
     rating: 4.9,
     users: 2100,
     icon: '💻',
+    categories: ['ai', 'development'],
   },
   {
     id: 4,
@@ -49,6 +54,7 @@ const AGENTS: MarketplaceAgent[] = [
     rating: 4.7,
     users: 540,
     icon: '🛡️',
+    categories: ['ai', 'security', 'audit'],
   },
   {
     id: 5,
@@ -58,6 +64,7 @@ const AGENTS: MarketplaceAgent[] = [
     rating: 4.5,
     users: 1670,
     icon: '🎨',
+    categories: ['ai', 'design'],
   },
   {
     id: 6,
@@ -67,6 +74,7 @@ const AGENTS: MarketplaceAgent[] = [
     rating: 4.9,
     users: 3200,
     icon: '📈',
+    categories: ['ai', 'finance'],
   },
 ];
 
@@ -80,7 +88,8 @@ const MIN_QUERY_LENGTH = 2;
 type InputChange = { target: { value: string } };
 
 export default function Marketplace() {
-  const [query, setQuery] = useState('');
+  const { query, categories, sort, setQuery, update } = useMarketplaceUrlState();
+  const [showFilters, setShowFilters] = useState(false);
   const trimmedQuery = query.trim();
   const isSearching = trimmedQuery.length >= MIN_QUERY_LENGTH;
 
@@ -93,7 +102,15 @@ export default function Marketplace() {
     { limit: AGENTS.length },
   );
 
-  const visible = isSearching ? results.map((hit) => hit.agent) : AGENTS;
+  const searched = isSearching ? results.map((hit) => hit.agent) : AGENTS;
+  const categorized = categories.length
+    ? searched.filter((agent) => categories.some((category) => agent.categories.includes(category)))
+    : searched;
+  const visible = [...categorized].sort((a, b) => {
+    if (sort === 'rating') return b.rating - a.rating;
+    if (sort === 'newest') return Number(b.id) - Number(a.id);
+    return b.users - a.users;
+  });
 
   let statusMessage: string;
   if (!isSearching) {
@@ -136,8 +153,13 @@ export default function Marketplace() {
                   aria-label="Search agents by description"
                   className="w-full sm:w-80 px-4 py-2 bg-white/5 border border-white/10 rounded-lg text-sm outline-none focus:border-trellis-leaf/60 transition-smooth"
                 />
-                <button className="px-4 py-2 bg-white/5 border border-white/10 rounded-lg text-sm hover:bg-white/10 transition-smooth">
-                  Filters
+                <button
+                  type="button"
+                  aria-expanded={showFilters}
+                  onClick={() => setShowFilters((open) => !open)}
+                  className="px-4 py-2 bg-white/5 border border-white/10 rounded-lg text-sm hover:bg-white/10 transition-smooth"
+                >
+                  Filters{categories.length ? ` (${categories.length})` : ''}
                 </button>
                 {/*
                   Native select chrome (arrow, padding, background) is drawn
@@ -148,12 +170,13 @@ export default function Marketplace() {
                 <div className="relative flex items-center">
                   <select
                     aria-label="Sort agents"
-                    defaultValue="Popularity"
+                    value={sort}
+                    onChange={(event: InputChange) => update({ sort: event.target.value as 'top' | 'newest' | 'rating' })}
                     className="appearance-none min-h-[44px] px-4 py-2 pr-9 bg-trellis-ground border border-white/10 rounded-lg text-sm text-gray-200 hover:bg-white/10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-trellis-leaf outline-none transition-smooth touch-manipulation"
                   >
-                    <option className="bg-trellis-ground text-white">Popularity</option>
-                    <option className="bg-trellis-ground text-white">Newest</option>
-                    <option className="bg-trellis-ground text-white">Rating</option>
+                    <option value="top" className="bg-trellis-ground text-white">Popularity</option>
+                    <option value="newest" className="bg-trellis-ground text-white">Newest</option>
+                    <option value="rating" className="bg-trellis-ground text-white">Rating</option>
                   </select>
                   <span
                     aria-hidden="true"
@@ -164,6 +187,26 @@ export default function Marketplace() {
                 </div>
               </div>
             </div>
+
+            {showFilters && (
+              <fieldset className="mb-6 flex flex-wrap gap-x-5 gap-y-2 text-sm text-gray-300">
+                <legend className="sr-only">Filter by category</legend>
+                {['ai', 'audit', 'analytics', 'development', 'design', 'finance', 'security', 'writing'].map((category) => (
+                  <label key={category} className="flex items-center gap-2 capitalize">
+                    <input
+                      type="checkbox"
+                      checked={categories.includes(category)}
+                      onChange={(event) => update({
+                        categories: event.target.checked
+                          ? [...categories, category]
+                          : categories.filter((selected) => selected !== category),
+                      })}
+                    />
+                    {category}
+                  </label>
+                ))}
+              </fieldset>
+            )}
 
             <p className="text-xs text-gray-500 mb-8" aria-live="polite">
               {statusMessage}

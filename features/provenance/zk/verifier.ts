@@ -360,7 +360,7 @@ async function loadDefaultBackend(): Promise<PairingBackend | null> {
     // held in a variable so bundlers and `tsc` treat it as a runtime-only,
     // unresolvable-at-build-time import.
     const specifier = "snarkjs";
-    const module = (await import(/* webpackIgnore: true */ specifier)) as unknown as {
+    const snarkModule = (await import(/* webpackIgnore: true */ specifier)) as unknown as {
       groth16?: {
         verify: (
           vkey: unknown,
@@ -369,10 +369,10 @@ async function loadDefaultBackend(): Promise<PairingBackend | null> {
         ) => Promise<boolean>;
       };
     };
-    if (!module?.groth16?.verify) return null;
+    if (!snarkModule?.groth16?.verify) return null;
     return {
       verify: (verificationKey, publicSignals, proof) =>
-        module.groth16!.verify(verificationKey, publicSignals, proof),
+        snarkModule.groth16!.verify(verificationKey, publicSignals, proof),
     };
   } catch {
     return null;

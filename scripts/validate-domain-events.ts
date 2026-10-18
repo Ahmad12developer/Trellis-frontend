@@ -22,12 +22,15 @@
  * See docs/DOMAIN_EVENTS.md for the versioning policy.
  */
 
-import { readdirSync, readFileSync } from 'node:fs';
+import { readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
+  buildSnapshot,
+  checkSchemaEvolution,
   collectCatalogProblems,
+  type SchemaSnapshot,
   describeCatalog,
   listDomainEventDefinitions,
   parseDomainEvent,
@@ -38,6 +41,8 @@ import { DOMAIN_EVENTS } from '../lib/domain-events/registry';
 
 const ROOT_DIR = resolve(fileURLToPath(import.meta.url), '../..');
 const FIXTURE_DIR = resolve(ROOT_DIR, 'tests/fixtures/domain-events');
+/** Historic schema descriptors for every published version. Update only when adding a version. */
+const SNAPSHOT_PATH = resolve(ROOT_DIR, 'lib/domain-events/schema-snapshot.json');
 
 const useColor = !process.env.NO_COLOR && process.stdout.isTTY;
 const colors = {
@@ -147,6 +152,24 @@ function main(): number {
     actual: 'invalid catalog',
     detail: problem,
   }));
+
+  if (args.includes('--update-snapshot')) {
+    writeFileSync(SNAPSHOT_PATH, `${JSON.stringify(buildSnapshot(DOMAIN_EVENTS as unknown as CatalogLike), null, 2)}\n`);
+    console.log(`Schema snapshot written to ${SNAPSHOT_PATH}`);
+    return failures.length === 0 ? 0 : 1;
+  }
+
+  // Schema evolution: compare against the committed historic versions.
+  const snapshot = JSON.parse(readFileSync(SNAPSHOT_PATH, 'utf-8')) as SchemaSnapshot;
+  for (const problem of checkSchemaEvolution(DOMAIN_EVENTS as unknown as CatalogLike, snapshot)) {
+    failures.push({
+      fixture: 'schema-evolution',
+      case: problem.event + (problem.from && problem.to && problem.from !== problem.to ? ` ${problem.from} -> ${problem.to}` : ''),
+      expected: 'backward compatible schema evolution',
+      actual: 'breaking change',
+      detail: problem.message,
+    });
+  }
 
   let checked = 0;
 

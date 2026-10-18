@@ -59,6 +59,10 @@ export interface SessionMetadata {
   reason?: string;
 }
 
+function snapshotSession(session: ImpersonationSession): ImpersonationSession {
+  return structuredClone(session);
+}
+
 export const AuditEventSchema = z.object({
   id: z.string().min(1),
   timestamp: z.string().datetime(),
@@ -226,6 +230,8 @@ class ImpersonationManager {
         scope,
         durationMinutes: duration,
         ipAddress: metadata?.ipAddress,
+        userAgent: metadata?.userAgent,
+        reason: metadata?.reason,
       },
     });
 
@@ -247,13 +253,17 @@ class ImpersonationManager {
     targetSessions.add(sessionId);
     this.sessionsByTarget.set(targetUserId, targetSessions);
 
-    return session;
+    return snapshotSession(session);
   }
 
   endSession(sessionId: string, reason?: string): void {
     const session = this.sessions.get(sessionId);
     if (!session) {
       throw new Error('Session not found');
+    }
+    if (!session.isActive || this.isExpired(session)) {
+      this.expireSession(session);
+      throw new Error('Session is already inactive');
     }
 
     session.isActive = false;
@@ -273,10 +283,10 @@ class ImpersonationManager {
 
     // Mark as expired if needed
     if (this.isExpired(session)) {
-      session.isActive = false;
+      this.expireSession(session);
     }
 
-    return session;
+    return snapshotSession(session);
   }
 
   isSessionActive(sessionId: string): boolean {
@@ -311,6 +321,10 @@ class ImpersonationManager {
     if (!session) {
       throw new Error('Session not found');
     }
+    if (!session.isActive || this.isExpired(session)) {
+      this.expireSession(session);
+      throw new Error('Cannot append an action to an inactive session');
+    }
 
     session.auditLog.push({
       id: this.generateEventId(),
@@ -318,7 +332,7 @@ class ImpersonationManager {
       action,
       resource,
       result,
-      metadata,
+      metadata: metadata ? structuredClone(metadata) : undefined,
     });
   }
 
@@ -331,7 +345,7 @@ class ImpersonationManager {
   getAuditLog(sessionId: string): AuditEvent[] {
     const session = this.getSession(sessionId);
     if (!session) return [];
-    return [...session.auditLog];
+    return structuredClone(session.auditLog);
   }
 
   getActiveSessions(): ImpersonationSession[] {
@@ -366,31 +380,10 @@ class ImpersonationManager {
   }
 
   clearExpiredSessions(): number {
-    const now = new Date();
     let cleared = 0;
-
-    const expiredIds: string[] = [];
-    this.sessions.forEach((session, id) => {
-      if (this.isExpired(session)) {
-        expiredIds.push(id);
-      }
-    });
-
-    expiredIds.forEach((id) => {
-      const session = this.sessions.get(id);
-      if (session) {
-        // Remove from tracking maps
-        const adminSessions = this.sessionsByAdmin.get(session.adminId);
-        if (adminSessions) {
-          adminSessions.delete(id);
-        }
-
-        const targetSessions = this.sessionsByTarget.get(session.targetUserId);
-        if (targetSessions) {
-          targetSessions.delete(id);
-        }
-
-        this.sessions.delete(id);
+    this.sessions.forEach((session) => {
+      if (session.isActive && this.isExpired(session)) {
+        this.expireSession(session);
         cleared += 1;
       }
     });
@@ -399,7 +392,7 @@ class ImpersonationManager {
   }
 
   getAllSessions(): ImpersonationSession[] {
-    return Array.from(this.sessions.values());
+    return Array.from(this.sessions.values(), snapshotSession);
   }
 
   getSessionStats(): { active: number; total: number; expired: number } {
@@ -412,7 +405,19 @@ class ImpersonationManager {
   }
 
   private isExpired(session: ImpersonationSession): boolean {
-    return new Date(session.expiresAt) < new Date();
+    return new Date(session.expiresAt).getTime() <= Date.now();
+  }
+
+  private expireSession(session: ImpersonationSession): void {
+    if (!session.isActive) return;
+    session.isActive = false;
+    session.auditLog.push({
+      id: this.generateEventId(),
+      timestamp: new Date().toISOString(),
+      action: 'session_expired',
+      resource: `user:${session.targetUserId}`,
+      result: 'success',
+    });
   }
 
   private generateSessionId(): string {

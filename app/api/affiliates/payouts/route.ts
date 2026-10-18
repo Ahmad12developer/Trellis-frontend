@@ -7,6 +7,8 @@ import {
   requestPayout,
 } from '@/lib/affiliate-store';
 import { checkRateLimit, createRateLimitResponse } from '@/lib/security/rate-limit';
+import { securityAuditLedger, walletAuditStreamId } from '@/lib/security/audit-ledger';
+import { csrfMiddleware } from '@/lib/security/csrf';
 
 const PAYOUTS_RATE_LIMIT = { maxRequests: 5, windowMs: 60 * 60 * 1000, scope: 'payouts' };
 
@@ -54,6 +56,9 @@ export async function GET(request: NextRequest) {
  * or a duplicate in-flight request) can never pay twice.
  */
 export async function POST(request: NextRequest) {
+  const csrfError = csrfMiddleware(request);
+  if (csrfError) return csrfError;
+
   try {
     const body = await request.json();
     const { walletAddress, amount, destinationAddress, idempotencyKey } = body;
@@ -91,6 +96,22 @@ export async function POST(request: NextRequest) {
         idempotencyKey: finalIdempotencyKey,
       });
 
+      if (!replayed) {
+        securityAuditLedger.append({
+          streamId: walletAuditStreamId(walletAddress),
+          category: 'financial',
+          eventType: 'affiliate.payout.queued',
+          actorId: 'affiliate-payout-api',
+          payload: {
+            payoutId: payout.id,
+            walletAddress: payout.walletAddress,
+            amount: payout.amount,
+            status: payout.status,
+            requestedAt: payout.requestedAt,
+          },
+        });
+      }
+
       return NextResponse.json(
         {
           ...payout,
@@ -103,6 +124,17 @@ export async function POST(request: NextRequest) {
       );
     } catch (error) {
       if (error instanceof PayoutError) {
+        securityAuditLedger.append({
+          streamId: walletAuditStreamId(walletAddress),
+          category: 'financial',
+          eventType: 'affiliate.payout.rejected',
+          actorId: 'affiliate-payout-api',
+          payload: {
+            walletAddress,
+            requestedAmount: String(amount),
+            reasonCode: error.code,
+          },
+        });
         return NextResponse.json(
           { error: error.message, code: error.code },
           { status: error.httpStatus }

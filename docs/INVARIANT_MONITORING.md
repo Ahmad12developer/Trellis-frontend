@@ -52,6 +52,41 @@ monitor.
 
 ---
 
+## Real-time webhook alerts
+
+The monitor can dispatch outbound webhook alerts the moment a violation is
+detected, so maintainers hear about a fund discrepancy or an unauthorized
+ownership mutation without waiting for someone to read a log.
+
+### Severity threshold rules
+
+Alert routing is driven by the severity the invariant declares:
+
+| Severity | Routing |
+|----------|---------|
+| `critical` | Immediate alert. Dispatched synchronously on detection. |
+| `error` | Immediate alert, batched per run. |
+| `warning` | Batched into the daily digest. Never paged. |
+
+The threshold is configurable via `alertThreshold` in the dispatcher options.
+The default is `error`, so `critical` and `error` violations alert immediately
+while `warning` findings accumulate into the daily digest.
+
+### Payload shape
+
+Every alert payload carries the diagnostic context a maintainer needs to
+triage without re-running the monitor:
+
+- the invariant `id`, `title`, `severity`, and `domain`
+- the `remediation` guidance for the invariant
+- the affected record IDs, so the implicated rows can be located directly
+- a `diff` block describing what was expected versus what was observed
+
+Slack, Discord, and PagerDuty destinations are supported. Each destination
+receives the same violation context, formatted for its own payload schema.
+
+---
+
 ## The four invariant domains
 
 | Domain | ID prefix | Question it answers |
@@ -190,6 +225,10 @@ CI runs the monitor against the healthy baseline on every build:
 To gate a deployment on a real snapshot, point `--file` at it and archive
 `--json` output as a build artifact so a later run can be diffed against it.
 
+To page maintainers on critical drift, configure a webhook destination and set
+`alertThreshold` to `critical` so only fund and authorization breaches dispatch
+immediately and everything else batches into the daily digest.
+
 ---
 
 ## Adding a new invariant
@@ -273,6 +312,11 @@ drift by design.
 XLM. That is far below the 100 XLM affiliate minimum payout, so no real
 affiliate payout can satisfy it. The invariant is reporting the policy, not the
 payout. Resolve the policy question separately; do not edit the snapshot.
+
+**No webhook alert fired for a critical violation.** Check that a destination
+is configured and that `alertThreshold` is at or below the violation's
+severity. A `critical` breach with the threshold set to `critical` dispatches
+immediately; a `warning` never pages regardless of threshold.
 
 ---
 

@@ -1,3 +1,5 @@
+import { encryptConfig, decryptConfig, generateKey } from './security/encryption';
+
 interface CacheConfig {
   name: string;
   version: string;
@@ -18,6 +20,15 @@ interface StorageQuota {
   usage: number;
   quota: number;
   percentage: number;
+}
+
+export interface CacheDiagnostic {
+  type: string;
+  entries: number;
+  staleEntries: number;
+  entriesWithoutTimestamp: number;
+  oldestAgeMs: number | null;
+  recommendation: string;
 }
 
 const STORAGE_QUOTA_THRESHOLD = 0.8;
@@ -132,17 +143,21 @@ class CacheManager {
     }
   }
 
-  private getLRUSortedKeys(type: string, keys: Request[]): Request[] {
-    return keys.sort((a, b) => {
+  private getLRUSortedKeys(type: string, keys: readonly Request[]): Request[] {
+    return [...keys].sort((a, b) => {
       const aAccess = this.lruOrder.get(`${type}:${a.url}`) || 0;
       const bAccess = this.lruOrder.get(`${type}:${b.url}`) || 0;
       return aAccess - bAccess;
     });
   }
 
-  private recordAccess(type: string, url: string): void {
+  private async recordAccess(type: string, url: string): Promise<void> {
     this.accessCounter++;
     this.lruOrder.set(`${type}:${url}`, this.accessCounter);
+    const config = this.cacheConfigs.get(type);
+    if (config) {
+      await this.cleanupCache(config.name, config.maxEntries);
+    }
   }
 
   public async getStorageQuota(): Promise<StorageQuota | null> {
@@ -357,6 +372,69 @@ class CacheManager {
     return stats;
   }
 
+  /** Inspect this browser's Trellis Cache Storage without exposing cached URLs or values. */
+  public async diagnoseCaches(now = Date.now()): Promise<CacheDiagnostic[]> {
+    const diagnostics: CacheDiagnostic[] = [];
+    for (const [type, config] of this.cacheConfigs) {
+      const cache = await caches.open(config.name);
+      const keys = await cache.keys();
+      let staleEntries = 0;
+      let entriesWithoutTimestamp = 0;
+      let oldestAgeMs: number | null = null;
+
+      for (const request of keys) {
+        const response = await cache.match(request);
+        const cachedAt = response?.headers.get('sw-cached-at');
+        const timestamp = cachedAt === null || cachedAt === undefined ? NaN : Number(cachedAt);
+        if (!Number.isFinite(timestamp) || timestamp <= 0 || timestamp > now) {
+          entriesWithoutTimestamp++;
+          continue;
+        }
+        const age = now - timestamp;
+        oldestAgeMs = oldestAgeMs === null ? age : Math.max(oldestAgeMs, age);
+        if (age > config.maxAge * 1000) staleEntries++;
+      }
+
+      diagnostics.push({
+        type,
+        entries: keys.length,
+        staleEntries,
+        entriesWithoutTimestamp,
+        oldestAgeMs,
+        recommendation: staleEntries
+          ? 'Remove entries past the configured max age and let the app fetch them again.'
+          : entriesWithoutTimestamp
+            ? 'Inspect entries without freshness evidence; the automatic repair leaves them untouched.'
+            : 'No stale cache entries detected.',
+      });
+    }
+    return diagnostics;
+  }
+
+  /** Remove only entries proven stale by the cache's configured max age. */
+  public async repairStaleCacheEntries(type?: string, now = Date.now()): Promise<number> {
+    const configs = type
+      ? [[type, this.cacheConfigs.get(type)] as const]
+      : Array.from(this.cacheConfigs.entries());
+    let removed = 0;
+    for (const [cacheType, config] of configs) {
+      if (!config) continue;
+      const cache = await caches.open(config.name);
+      for (const request of await cache.keys()) {
+        const response = await cache.match(request);
+        const cachedAt = response?.headers.get('sw-cached-at');
+        const timestamp = cachedAt === null || cachedAt === undefined ? NaN : Number(cachedAt);
+        if (Number.isFinite(timestamp) && timestamp > 0 && timestamp <= now && now - timestamp > config.maxAge * 1000) {
+          if (await cache.delete(request)) {
+            this.lruOrder.delete(`${cacheType}:${request.url}`);
+            removed++;
+          }
+        }
+      }
+    }
+    return removed;
+  }
+
   private async cleanupCache(cacheName: string, maxEntries: number): Promise<void> {
     const cache = await caches.open(cacheName);
     const keys = await cache.keys();
@@ -365,11 +443,12 @@ class CacheManager {
       return;
     }
 
-    const lruSorted = this.getLRUSortedKeys(cacheName, keys);
+    const type = Array.from(this.cacheConfigs.entries()).find(([, cfg]) => cfg.name === cacheName)?.[0] || cacheName;
+    const lruSorted = this.getLRUSortedKeys(type, keys);
     const entriesToRemove = lruSorted.slice(0, keys.length - maxEntries);
     for (const request of entriesToRemove) {
       await cache.delete(request);
-      this.lruOrder.delete(`${cacheName}:${request.url}`);
+      this.lruOrder.delete(`${type}:${request.url}`);
     }
   }
 
@@ -625,8 +704,11 @@ class CacheManager {
 
 export default CacheManager;
 
-const METADATA_DB = 'trellis-ipfs-metadata';
-const METADATA_STORE = 'verified';
+export const METADATA_DB = 'trellis-ipfs-metadata';
+export const METADATA_STORE = 'verified';
+export const DRAFTS_STORE = 'offline-drafts';
+export const TELEMETRY_STORE = 'telemetry';
+export const DEFAULT_STORES = [METADATA_STORE, DRAFTS_STORE, TELEMETRY_STORE];
 const CACHE_ENTRY_MARKER = '__trellisCachedValue';
 const DEFAULT_STALE_TIME = 60_000;
 const DEFAULT_CACHE_TIME = 5 * 60_000;
@@ -647,11 +729,43 @@ const memoryMetadata = new Map<string, StoredCacheEntry<unknown>>();
 const cacheSubscribers = new Map<string, Set<(value: unknown) => void>>();
 const pendingRevalidations = new Map<string, Promise<unknown>>();
 
-function openMetadataDb(): Promise<IDBDatabase | null> {
+function openMetadataDb(version = 1): Promise<IDBDatabase | null> {
   if (typeof indexedDB === 'undefined') return Promise.resolve(null);
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open(METADATA_DB, 1);
-    request.onupgradeneeded = () => request.result.createObjectStore(METADATA_STORE);
+    const request = indexedDB.open(METADATA_DB, version);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      for (const store of DEFAULT_STORES) {
+        if (!db.objectStoreNames.contains(store)) {
+          db.createObjectStore(store);
+        }
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+export async function ensureMetadataDb(): Promise<IDBDatabase | null> {
+  const db = await openMetadataDb(1);
+  if (!db) return null;
+  const missing = DEFAULT_STORES.filter(s => !db.objectStoreNames.contains(s));
+  if (missing.length === 0) return db;
+
+  const currentVersion = db.version;
+  db.close();
+
+  return new Promise((resolve, reject) => {
+    const nextVersion = currentVersion + 1;
+    const request = indexedDB.open(METADATA_DB, nextVersion);
+    request.onupgradeneeded = () => {
+      const upgradeDb = request.result;
+      for (const store of DEFAULT_STORES) {
+        if (!upgradeDb.objectStoreNames.contains(store)) {
+          upgradeDb.createObjectStore(store);
+        }
+      }
+    };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
   });
@@ -804,3 +918,530 @@ function fetchAndStore<T>(key: string, fetcher: () => Promise<T>): Promise<T> {
   pendingRevalidations.set(key, request);
   return request;
 }
+
+// --- IndexedDB Snapshot Exporter & Restore Tool ---
+
+export interface SnapshotRecord {
+  key?: IDBValidKey;
+  value: unknown;
+}
+
+export interface SnapshotStore {
+  name: string;
+  records: SnapshotRecord[];
+}
+
+export interface SnapshotDatabase {
+  name: string;
+  version: number;
+  stores: SnapshotStore[];
+}
+
+export interface DatabaseSnapshotPayload {
+  version: number;
+  app: 'trellis';
+  timestamp: string;
+  checksum: string;
+  databases: SnapshotDatabase[];
+}
+
+export interface EncryptedDatabaseSnapshot {
+  version: number;
+  encrypted: true;
+  algorithm: 'AES-GCM-256';
+  payload: string;
+  checksum: string;
+  timestamp: string;
+}
+
+export interface ExportSnapshotOptions {
+  passphrase?: string;
+  databaseNames?: string[];
+}
+
+export interface RestoreSnapshotOptions {
+  passphrase?: string;
+  overwrite?: boolean;
+}
+
+export interface RestoreResult {
+  success: boolean;
+  restoredDatabases: number;
+  restoredStores: number;
+  restoredRecords: number;
+  errors?: string[];
+}
+
+export interface SnapshotValidationResult {
+  valid: boolean;
+  error?: string;
+  payload?: DatabaseSnapshotPayload;
+}
+
+/**
+ * Computes an integrity checksum (SHA-256 with fallback).
+ */
+export async function computeSnapshotChecksum(content: string): Promise<string> {
+  if (typeof crypto !== 'undefined' && crypto.subtle?.digest) {
+    try {
+      const encoder = new TextEncoder();
+      const data = encoder.encode(content);
+      const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+      const hashArray = Array.from(new Uint8Array(hashBuffer));
+      return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+    } catch {
+      // fallback if digest fails
+    }
+  }
+
+  // Fallback hash
+  let hash = 0;
+  for (let i = 0; i < content.length; i++) {
+    const char = content.charCodeAt(i);
+    hash = ((hash << 5) - hash) + char;
+    hash |= 0;
+  }
+  return Math.abs(hash).toString(16).padStart(8, '0');
+}
+
+/**
+ * Exports IndexedDB database snapshots dumping object stores to JSON (encrypted when passphrase is provided).
+ */
+export async function exportDatabaseSnapshot(
+  options: ExportSnapshotOptions = {}
+): Promise<string> {
+  if (typeof indexedDB === 'undefined') {
+    throw new Error('IndexedDB is not supported in this environment');
+  }
+
+  await ensureMetadataDb();
+
+  let dbNames: string[] = options.databaseNames ?? [];
+  if (dbNames.length === 0) {
+    if (typeof indexedDB.databases === 'function') {
+      try {
+        const dbs = await indexedDB.databases();
+        dbNames = dbs.map(d => d.name).filter((name): name is string => Boolean(name));
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  if (dbNames.length === 0 || !dbNames.includes(METADATA_DB)) {
+    dbNames = Array.from(new Set([METADATA_DB, ...dbNames]));
+  }
+
+  const databaseSnapshots: SnapshotDatabase[] = [];
+
+  for (const dbName of dbNames) {
+    const db = await new Promise<IDBDatabase | null>((resolve, reject) => {
+      const req = indexedDB.open(dbName);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+
+    if (!db) continue;
+
+    const storeNames = Array.from(db.objectStoreNames);
+    const storeSnapshots: SnapshotStore[] = [];
+
+    if (storeNames.length > 0) {
+      const tx = db.transaction(storeNames, 'readonly');
+      for (const storeName of storeNames) {
+        const objectStore = tx.objectStore(storeName);
+        const records: SnapshotRecord[] = await new Promise((resolve, reject) => {
+          const list: SnapshotRecord[] = [];
+          const cursorReq = objectStore.openCursor();
+          cursorReq.onsuccess = () => {
+            const cursor = cursorReq.result;
+            if (cursor) {
+              list.push({
+                key: cursor.key,
+                value: cursor.value,
+              });
+              cursor.continue();
+            } else {
+              resolve(list);
+            }
+          };
+          cursorReq.onerror = () => reject(cursorReq.error);
+        });
+
+        storeSnapshots.push({
+          name: storeName,
+          records,
+        });
+      }
+    }
+
+    databaseSnapshots.push({
+      name: db.name,
+      version: db.version,
+      stores: storeSnapshots,
+    });
+
+    db.close();
+  }
+
+  const checksum = await computeSnapshotChecksum(JSON.stringify(databaseSnapshots));
+
+  const rawPayload: DatabaseSnapshotPayload = {
+    version: 1,
+    app: 'trellis',
+    timestamp: new Date().toISOString(),
+    checksum,
+    databases: databaseSnapshots,
+  };
+
+  if (options.passphrase) {
+    const encryptedData = await encryptConfig(JSON.stringify(rawPayload), options.passphrase);
+    const encryptedContainer: EncryptedDatabaseSnapshot = {
+      version: 1,
+      encrypted: true,
+      algorithm: 'AES-GCM-256',
+      payload: encryptedData,
+      checksum,
+      timestamp: rawPayload.timestamp,
+    };
+    return JSON.stringify(encryptedContainer, null, 2);
+  }
+
+  return JSON.stringify(rawPayload, null, 2);
+}
+
+/**
+ * Validates the schema and structural integrity of an imported database snapshot.
+ */
+export function validateSnapshotSchema(data: unknown): SnapshotValidationResult {
+  if (typeof data !== 'object' || data === null) {
+    return { valid: false, error: 'Snapshot data must be a valid JSON object' };
+  }
+
+  const obj = data as Record<string, unknown>;
+
+  if (obj.version !== 1) {
+    return { valid: false, error: `Unsupported snapshot version: ${obj.version}` };
+  }
+
+  if (obj.app !== 'trellis') {
+    return { valid: false, error: `Invalid snapshot: missing or incorrect application signature (${obj.app})` };
+  }
+
+  if (!Array.isArray(obj.databases)) {
+    return { valid: false, error: 'Invalid snapshot: databases property must be an array' };
+  }
+
+  for (let d = 0; d < obj.databases.length; d++) {
+    const db = obj.databases[d];
+    if (typeof db !== 'object' || db === null) {
+      return { valid: false, error: `Database at index ${d} is invalid` };
+    }
+    if (typeof db.name !== 'string' || !db.name) {
+      return { valid: false, error: `Database at index ${d} missing valid name` };
+    }
+    if (typeof db.version !== 'number' || db.version < 1) {
+      return { valid: false, error: `Database "${db.name}" missing valid version number` };
+    }
+    if (!Array.isArray(db.stores)) {
+      return { valid: false, error: `Database "${db.name}" stores must be an array` };
+    }
+
+    for (let s = 0; s < db.stores.length; s++) {
+      const store = db.stores[s];
+      if (typeof store !== 'object' || store === null) {
+        return { valid: false, error: `Store at index ${s} in database "${db.name}" is invalid` };
+      }
+      if (typeof store.name !== 'string' || !store.name) {
+        return { valid: false, error: `Store at index ${s} in database "${db.name}" missing valid name` };
+      }
+      if (!Array.isArray(store.records)) {
+        return { valid: false, error: `Store "${store.name}" records must be an array` };
+      }
+      for (let r = 0; r < store.records.length; r++) {
+        const rec = store.records[r];
+        if (typeof rec !== 'object' || rec === null) {
+          return { valid: false, error: `Record at index ${r} in store "${store.name}" is invalid` };
+        }
+      }
+    }
+  }
+
+  return { valid: true, payload: obj as unknown as DatabaseSnapshotPayload };
+}
+
+function base64ToBuffer(base64: string): ArrayBuffer {
+  if (typeof window !== 'undefined' && typeof window.atob === 'function') {
+    const binary = window.atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes.buffer;
+  }
+  return Buffer.from(base64, 'base64').buffer;
+}
+
+async function decryptSnapshotPayload(encryptedPayload: string, passphrase: string): Promise<string> {
+  const payload = JSON.parse(encryptedPayload);
+  const salt = new Uint8Array(base64ToBuffer(payload.salt));
+  const iv = new Uint8Array(base64ToBuffer(payload.iv));
+  const ciphertext = new Uint8Array(base64ToBuffer(payload.ciphertext));
+
+  const key = await generateKey(passphrase, salt);
+  const decrypted = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv },
+    key,
+    ciphertext
+  );
+  return new TextDecoder().decode(decrypted);
+}
+
+/**
+ * Restores a snapshot into IndexedDB after schema and integrity verification.
+ */
+export async function restoreDatabaseSnapshot(
+  snapshotJson: string,
+  options: RestoreSnapshotOptions = {}
+): Promise<RestoreResult> {
+  if (typeof indexedDB === 'undefined') {
+    throw new Error('IndexedDB is not supported in this environment');
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(snapshotJson);
+  } catch (err: any) {
+    throw new Error(`Failed to parse snapshot JSON: ${err?.message || err}`);
+  }
+
+  let payload: DatabaseSnapshotPayload;
+
+  // Handle encrypted snapshot
+  if (typeof parsed === 'object' && parsed !== null && (parsed as any).encrypted === true) {
+    const enc = parsed as EncryptedDatabaseSnapshot;
+    if (!options.passphrase) {
+      throw new Error('Snapshot is encrypted. Passphrase is required for restoration.');
+    }
+
+    let decryptedJson: string;
+    try {
+      decryptedJson = await decryptSnapshotPayload(enc.payload, options.passphrase);
+    } catch {
+      throw new Error('Decryption failed. Incorrect passphrase or corrupted data.');
+    }
+
+    try {
+      payload = JSON.parse(decryptedJson);
+    } catch {
+      throw new Error('Failed to parse decrypted snapshot JSON.');
+    }
+  } else {
+    payload = parsed as DatabaseSnapshotPayload;
+  }
+
+  // Schema validation
+  const validation = validateSnapshotSchema(payload);
+  if (!validation.valid || !validation.payload) {
+    throw new Error(`Snapshot schema validation failed: ${validation.error}`);
+  }
+
+  // Integrity checksum verification
+  if (payload.checksum) {
+    const expectedChecksum = await computeSnapshotChecksum(JSON.stringify(payload.databases));
+    if (expectedChecksum !== payload.checksum) {
+      throw new Error('Snapshot integrity check failed: checksum mismatch or corrupted data.');
+    }
+  }
+
+  let restoredDatabases = 0;
+  let restoredStores = 0;
+  let restoredRecords = 0;
+
+  for (const dbSnapshot of payload.databases) {
+    const targetStoreNames = dbSnapshot.stores.map(s => s.name);
+
+    let db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const openReq = indexedDB.open(dbSnapshot.name);
+      openReq.onsuccess = () => resolve(openReq.result);
+      openReq.onerror = () => reject(openReq.error);
+    });
+
+    const missingStores = targetStoreNames.filter(name => !db.objectStoreNames.contains(name));
+    if (missingStores.length > 0) {
+      const nextVersion = db.version + 1;
+      db.close();
+      db = await new Promise<IDBDatabase>((resolve, reject) => {
+        const upgradeReq = indexedDB.open(dbSnapshot.name, nextVersion);
+        upgradeReq.onupgradeneeded = () => {
+          const upgradeDb = upgradeReq.result;
+          for (const missing of missingStores) {
+            if (!upgradeDb.objectStoreNames.contains(missing)) {
+              upgradeDb.createObjectStore(missing);
+            }
+          }
+        };
+        upgradeReq.onsuccess = () => resolve(upgradeReq.result);
+        upgradeReq.onerror = () => reject(upgradeReq.error);
+      });
+    }
+
+    if (targetStoreNames.length > 0) {
+      await new Promise<void>((resolve, reject) => {
+        const tx = db.transaction(targetStoreNames, 'readwrite');
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+
+        for (const storeSnapshot of dbSnapshot.stores) {
+          const objectStore = tx.objectStore(storeSnapshot.name);
+
+          if (options.overwrite !== false) {
+            objectStore.clear();
+          }
+
+          for (const rec of storeSnapshot.records) {
+            if (rec.key !== undefined) {
+              objectStore.put(rec.value, rec.key);
+            } else {
+              objectStore.put(rec.value);
+            }
+            restoredRecords++;
+          }
+          restoredStores++;
+        }
+      });
+    }
+
+    if (dbSnapshot.name === METADATA_DB) {
+      const verifiedStore = dbSnapshot.stores.find(s => s.name === METADATA_STORE);
+      if (verifiedStore) {
+        for (const rec of verifiedStore.records) {
+          if (rec.key !== undefined && typeof rec.key === 'string') {
+            const entry = isStoredCacheEntry(rec.value)
+              ? rec.value
+              : { [CACHE_ENTRY_MARKER]: true, value: rec.value, cachedAt: Date.now() };
+            memoryMetadata.set(rec.key, entry as any);
+          }
+        }
+      }
+    }
+
+    db.close();
+    restoredDatabases++;
+  }
+
+  return {
+    success: true,
+    restoredDatabases,
+    restoredStores,
+    restoredRecords,
+  };
+}
+
+// --- Offline Drafts & Telemetry Helpers ---
+
+export async function saveOfflineDraft(id: string, data: unknown): Promise<void> {
+  const db = await ensureMetadataDb();
+  if (!db) return;
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(DRAFTS_STORE, 'readwrite');
+    tx.objectStore(DRAFTS_STORE).put(data, id);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+  db.close();
+}
+
+export async function getOfflineDraft<T>(id: string): Promise<T | null> {
+  const db = await ensureMetadataDb();
+  if (!db) return null;
+  const result = await new Promise<T | null>((resolve, reject) => {
+    const tx = db.transaction(DRAFTS_STORE, 'readonly');
+    const req = tx.objectStore(DRAFTS_STORE).get(id);
+    req.onsuccess = () => resolve(req.result ?? null);
+    req.onerror = () => reject(req.error);
+  });
+  db.close();
+  return result;
+}
+
+export async function listOfflineDrafts(): Promise<Array<{ id: string; data: unknown }>> {
+  const db = await ensureMetadataDb();
+  if (!db) return [];
+  const results = await new Promise<Array<{ id: string; data: unknown }>>((resolve, reject) => {
+    const list: Array<{ id: string; data: unknown }> = [];
+    const tx = db.transaction(DRAFTS_STORE, 'readonly');
+    const req = tx.objectStore(DRAFTS_STORE).openCursor();
+    req.onsuccess = () => {
+      const cursor = req.result;
+      if (cursor) {
+        list.push({ id: String(cursor.key), data: cursor.value });
+        cursor.continue();
+      } else {
+        resolve(list);
+      }
+    };
+    req.onerror = () => reject(req.error);
+  });
+  db.close();
+  return results;
+}
+
+export async function deleteOfflineDraft(id: string): Promise<void> {
+  const db = await ensureMetadataDb();
+  if (!db) return;
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(DRAFTS_STORE, 'readwrite');
+    tx.objectStore(DRAFTS_STORE).delete(id);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+  db.close();
+}
+
+export async function logTelemetryEvent(id: string, event: unknown): Promise<void> {
+  const db = await ensureMetadataDb();
+  if (!db) return;
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(TELEMETRY_STORE, 'readwrite');
+    tx.objectStore(TELEMETRY_STORE).put(event, id);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+  db.close();
+}
+
+export async function getTelemetryLogs(): Promise<Array<{ id: string; event: unknown }>> {
+  const db = await ensureMetadataDb();
+  if (!db) return [];
+  const results = await new Promise<Array<{ id: string; event: unknown }>>((resolve, reject) => {
+    const list: Array<{ id: string; event: unknown }> = [];
+    const tx = db.transaction(TELEMETRY_STORE, 'readonly');
+    const req = tx.objectStore(TELEMETRY_STORE).openCursor();
+    req.onsuccess = () => {
+      const cursor = req.result;
+      if (cursor) {
+        list.push({ id: String(cursor.key), event: cursor.value });
+        cursor.continue();
+      } else {
+        resolve(list);
+      }
+    };
+    req.onerror = () => reject(req.error);
+  });
+  db.close();
+  return results;
+}
+
+export async function clearTelemetryLogs(): Promise<void> {
+  const db = await ensureMetadataDb();
+  if (!db) return;
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(TELEMETRY_STORE, 'readwrite');
+    tx.objectStore(TELEMETRY_STORE).clear();
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+  db.close();
+}
+

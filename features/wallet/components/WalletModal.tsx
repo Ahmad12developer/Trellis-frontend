@@ -4,6 +4,7 @@ import React, { useState } from "react";
 import { useRouter } from "next/navigation";
 import { getAllAdapters, getAdapter, isAdapterAvailable, type StellarWalletAdapter } from "@/lib/wallet/StellarWalletAdapter";
 import { useStellarWallet } from "@/components/context/StellarWalletProvider";
+import useFocusTrap from "@/components/useFocusTrap";
 
 export function WalletModal() {
   const [isOpen, setIsOpen] = useState(false);
@@ -30,6 +31,11 @@ export function WalletModal() {
     }
   };
 
+  const trapRef = useFocusTrap<HTMLDivElement>({
+    active: isOpen,
+    onEscape: () => setIsOpen(false),
+  });
+
   return (
     <>
       <button
@@ -40,13 +46,20 @@ export function WalletModal() {
       </button>
 
       {isOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+        <div
+          ref={trapRef}
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="select-wallet-title"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+        >
           <div className="bg-neutral-900 border border-neutral-700 rounded-xl p-6 max-w-md w-full mx-4">
             <div className="flex items-center justify-between mb-4">
-              <h2 className="text-xl font-bold text-white">Select Wallet</h2>
+              <h2 id="select-wallet-title" className="text-xl font-bold text-white">Select Wallet</h2>
               <button
                 onClick={() => setIsOpen(false)}
                 className="text-neutral-400 hover:text-white text-xl"
+                aria-label="Close dialog"
               >
                 ✕
               </button>

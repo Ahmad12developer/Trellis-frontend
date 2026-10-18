@@ -6,6 +6,7 @@ import { BonusChart } from './BonusChart';
 import { BonusNotifications } from './BonusNotifications';
 import { ImpermanentLossCalculator } from './ImpermanentLossCalculator';
 import { LiquidityPositions } from './LiquidityPositions';
+import { YieldCalculator } from './YieldCalculator';
 import { useBonusStore } from '@/store/useBonusStore';
 
 export const BonusDashboard: React.FC = () => {

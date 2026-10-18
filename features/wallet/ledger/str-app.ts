@@ -360,11 +360,11 @@ export async function createLedgerStrApp(
 
 async function loadVendorStrApp(): Promise<VendorStrAppConstructor | null> {
   try {
-    const module = (await import("@ledgerhq/hw-app-str")) as {
+    const ledgerModule = (await import("@ledgerhq/hw-app-str")) as {
       default?: unknown;
       Str?: unknown;
     };
-    const candidate = (module.default ?? module.Str) as VendorStrAppConstructor | undefined;
+    const candidate = (ledgerModule.default ?? ledgerModule.Str) as VendorStrAppConstructor | undefined;
     return typeof candidate === "function" ? candidate : null;
   } catch {
     return null;

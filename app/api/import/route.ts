@@ -2,12 +2,19 @@ import { NextRequest, NextResponse } from 'next/server';
 import { runImportPipeline } from '@/lib/import/pipeline';
 import { ImportOptions } from '@/lib/import/types';
 import { runImportPipelineWithProgress } from '@/lib/import/stream';
+import { checkRateLimit, createRateLimitResponse } from '@/lib/security/rate-limit';
+import { csrfMiddleware } from '@/lib/security/csrf';
+
+const IMPORT_RATE_LIMIT = { maxRequests: 10, windowMs: 15 * 60 * 1000, scope: 'import' };
 
 /**
  * POST /api/import
  * Execute bulk import pipeline with validation, idempotency, duplicate detection, and rollback guidance.
  */
 export async function POST(request: NextRequest) {
+  const csrfError = csrfMiddleware(request);
+  if (csrfError) return csrfError;
+
   const rl = checkRateLimit(request, IMPORT_RATE_LIMIT);
   if (rl.blocked) {
     return createRateLimitResponse(rl, 'Import rate limit exceeded. Please try again later.');

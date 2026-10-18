@@ -192,11 +192,11 @@ async function loadWebSocketImpl(): Promise<WebSocketFactory | null> {
   }
 
   try {
-    const module = (await import("ws")) as unknown as {
+    const wsModule = (await import("ws")) as unknown as {
       default?: unknown;
       WebSocket?: unknown;
     };
-    const implementation = module.default ?? module.WebSocket;
+    const implementation = wsModule.default ?? wsModule.WebSocket;
 
     return typeof implementation === "function"
       ? (implementation as WebSocketFactory)

@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 /**
  * Pure connection-state machine for the agent telemetry transport.
  *
@@ -37,7 +38,7 @@ export interface TelemetryConnectionState {
   /** Active transport, or `null` while connecting / after close. */
   transport: TelemetryTransportKind | null;
   fallbackReason: TelemetryFallbackReason | null;
-  /** Number of times the transport fell back from WebRTC to WebSocket. */
+  /** Number of times the transport fell back from WebRTC -> WebSocket. */
   fallbacks: number;
   /** Number of connection attempts (start + reconnects). */
   attempts: number;
@@ -73,15 +74,15 @@ export function initialTelemetryConnectionState(now = 0): TelemetryConnectionSta
  *
  * Transition table:
  *
- * | event           | from                              | to                              |
- * | --------------- | --------------------------------- | ------------------------------- |
+ * | event           | from                              | to                          |
+ * | --------------  | ------------------------------ | ------------------------------- |
  * | start           | any                               | connecting (attempts + 1)       |
  * | negotiate       | connecting, negotiating           | negotiating                     |
- * | webrtc-open     | any but closed                    | open / webrtc                   |
- * | websocket-open  | any but closed                    | open / websocket                |
- * | fallback        | any but closed                    | connecting (fallbacks + 1)      |
- * | reconnect       | any but closed                    | reconnecting (attempts + 1)     |
- * | error           | any but closed                    | error                           |
+ * | webrtc-open     | any but closed                        | open / webrtc                    |
+ * | websocket-open  | any but closed                        | open / websocket                 |
+ * | fallback       | any but closed                        | connecting (fallbacks + 1)      |
+ * | reconnect      | any but closed                        | reconnecting (attempts + 1)     |
+ * | error          | any but closed                        | error                           |
  * | close / dispose | any                               | closed                          |
  *
  * Events that are invalid for the current state (for example `webrtc-open`
@@ -166,7 +167,7 @@ export function isTelemetryConnectionOpen(state: TelemetryConnectionState): bool
 export type LegacyTelemetryStatus = 'idle' | 'connecting' | 'open' | 'closed' | 'error';
 
 /** Collapse the richer machine status onto the dashboard's original status union. */
-export function toLegacyTelemetryStatus(state: TelemetryConnectionState): LegacyTelemetryStatus {
+export function toLegacyTelelemetryStatus(state: TelemetryConnectionState): LegacyTelemetryStatus {
   switch (state.status) {
     case 'open':
       return 'open';
@@ -193,8 +194,8 @@ export interface TelemetryConnectionMachine {
 export function createTelemetryConnectionMachine(
   initial?: TelemetryConnectionState
 ): TelemetryConnectionMachine {
-  let current = initial ?? initialTelemetryConnectionState();
-  const listeners = new Set<(state: TelemetryConnectionState) => void>();
+  let current = initial ?? initialTelelemetryConnectionState();
+  const listeners = new Set<((state: TelemetryConnectionState) => void)>();
 
   return {
     getState: () => current,
@@ -210,4 +211,201 @@ export function createTelemetryConnectionMachine(
       };
     },
   };
+}
+
+/**
+ * Deterministic chaos-test harness for the telemetry connection machine.
+ *
+ * The harness drives the pure reducer with a scripted, seeded sequence of
+ * events so tests can inject network failures, restarts, stale reads, and
+ * retries without relying on wall-clock timing or real sockets. Every run is
+ * reproducible: given the same seed and script, the emitted event log and
+ * final state are byte-for-byte identical.
+ */
+
+export type TelemetryChaosFault =
+  | 'network-drop'
+  | 'restart'
+  | 'stale-read'
+  | 'retry'
+  | 'signaling-failure'
+  | 'ice-failure'
+  | 'channel-timeout';
+
+export interface TelemetryChaosStep {
+  /** Logical tick used as the `now` value; never derived from `Date.now()`. */
+  tick: number;
+  fault: TelemetryChaosFault;
+  /** Optional message attached to error events. */
+  message?: string;
+}
+
+export interface TelemetryChaosScript {
+  seed: string;
+  steps: TelemetryChaosStep[];
+}
+
+export interface TelemetryChaosTraceEntry {
+  tick: number;
+  fault: TelemetryChaosFault;
+  event: TelemetryConnectionEvent;
+  status: TelemetryConnectionStatus;
+  transport: TelemetryTransportKind | null;
+  attempts: number;
+  fallbacks: number;
+}
+
+export interface TelemetryChaosResult {
+  seed: string;
+  trace: TelemetryChaosTraceEntry[];
+  finalState: TelemetryConnectionState;
+  /** Stable digest of the trace, useful for golden/snapshot assertions. */
+  digest: string;
+}
+
+/**
+ * Deterministic PRNG (mulberr32) seeded from a string. We avoid
+ * `Math.random` so chaos runs are reproducible across machines and CI.
+ */
+function createSeededRandom(seed: string): () => number {
+  const hash = createHash('sha256').update(seed).digest();
+  let state = hash.readUInt32LE(0) || 0x9e3779b9;
+  return () => {
+    state |= 0;
+    state = (state + 0x6d2b79f5) | 0;
+    let t = state;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/**
+ * Map a chaos fault onto the reducer event(s) that model it. Faults are
+ * expressed purely in terms of the public event union so the harness stays
+ * compatible with the existing machine contract.
+ */
+export function chaosFaultToEvents(
+  fault: TelemetryChaosFault,
+  tick: number,
+  message?: string
+): TelemetryConnectionEvent[] {
+  switch (fault) {
+    case 'network-drop':
+      return [
+        { type: 'error', message: message ?? 'network-drop', now: tick },
+        { type: 'reconnect', now: tick },
+      ];
+    case 'restart':
+      return [
+        { type: 'close', now: tick },
+        { type: 'start', now: tick },
+      ];
+    case 'stale-read':
+      // A late callback from a torn-down transport must be ignored.
+      return [{ type: 'webrtc-open', now: tick }];
+    case 'retry':
+      return [{ type: 'reconnect', now: tick }];
+    case 'signaling-failure':
+      return [{ type: 'fallback', reason: 'signaling-failed', now: tick }];
+    case 'ice-failure':
+      return [{ type: 'fallback', reason: 'ice-failed', now: tick }];
+    case 'channel-timeout':
+      return [{ type: 'fallback', reason: 'channel-timeout', now: tick }];
+    default:
+      return [];
+  }
+}
+
+/**
+ * Run a deterministic chaos script against a fresh connection machine.
+ *
+ * The function never touches timers, sockets, or `Date.now()`; all temporal
+ * information comes from the script's logical ticks. This makes the suite
+ * safe to run under plain Node and immune to flaky CI timing.
+ */
+export function runTelemetryChaosScript(
+  script: TelemetryChaosScript
+): TelemetryChaosResult {
+  const machine = createTelemetryConnectionMachine(
+    initialTelemetryConnectionState(0)
+  );
+  const trace: TelemetryChaosTraceEntry[] = [];
+
+  // Seed the PRNG so any future randomized fault selection stays reproducible.
+  const random = createSeededRandom(script.seed);
+  void random();
+
+  for (const step of script.steps) {
+    const events = chaosFaultToEvents(step.fault, step.tick, step.message);
+    for (const event of events) {
+      const state = machine.send(event);
+      trace.push({
+        tick: step.tick,
+        fault: step.fault,
+        event,
+        status: state.status,
+        transport: state.transport,
+        attempts: state.attempts,
+        fallbacks: state.fallbacks,
+      });
+    }
+  }
+
+  const finalState = machine.getState();
+  const digest = createHash('sha256')
+    .update(
+      JSON.stringify({
+        seed: script.seed,
+        trace: trace.map((entry) => ({
+          tick: entry.tick,
+          fault: entry.fault,
+          event: entry.event,
+          status: entry.status,
+          transport: entry.transport,
+          attempts: entry.attempts,
+          fallbacks: entry.fallbacks,
+        })),
+        finalState,
+      })
+    )
+    .digest('hex');
+
+  return { seed: script.seed, trace, finalState, digest };
+}
+
+/**
+ * Built-in chaos scripts covering the acceptance criteria: network failures,
+ * restarts, stale reads, and retries. Each script is deterministic and
+ * safe to run in CI without timers or sockets.
+ */
+export const TELEMETRY_CHAOS_SCRIPTS: ReadonlyArray<TelemetryChaosScript> = [
+  {
+    seed: 'network-drop-recovery',
+    steps: [
+      { tick: 1, fault: 'network-drop' },
+      { tick: 2, fault: 'retry' },
+      { tick: 3, fault: 'stale-read' },
+    ],
+  },
+  {
+    seed: 'restart-cycle',
+    steps: [
+      { tick: 1, fault: 'restart' },
+      { tick: 2, fault: 'signaling-failure' },
+      { tick: 3, fault: 'ice-failure' },
+      { tick: 4, fault: 'channel-timeout' },
+    ],
+  },
+  {
+    seed: 'stale-read-ignored',
+    steps: [
+      { tick: 1, fault: 'restart' },
+      { tick: 2, fault: 'stale-read' },
+    ],
+  },
+];
+
+export function runAllTelemetryChaosScripts(): TelemetryChaosResult[] {
+  return TELEMETRY_CHAOS_SCRIPTS.map(runTelemetryChaosScript);
 }

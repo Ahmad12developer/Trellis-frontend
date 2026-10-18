@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 
 import { getBugReports } from '@/app/api/bug-reports/route';
 import { buildGitHubIssuePayload, mapGithubIssueStateToBugReportStatus } from '@/lib/bug-report-sync';
+import { csrfMiddleware } from '@/lib/security/csrf';
 import type { BugReport } from '@/types/bug-report';
 
 const DEFAULT_REPOSITORY = 'TRELLIS-STELLAR/Trellis-frontend';
@@ -138,6 +139,9 @@ export async function POST(request: NextRequest) {
       const payload = await request.json().catch(() => ({}));
       return handleGitHubWebhook(payload as Record<string, unknown>);
     }
+
+    const csrfError = csrfMiddleware(request);
+    if (csrfError) return csrfError;
 
     const body = await request.json().catch(() => ({}));
     const action = typeof body?.action === 'string' ? body.action : 'approve';

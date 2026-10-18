@@ -15,6 +15,7 @@ const KEY_SCREENS: Array<{ path: string; heading?: RegExp; label: string }> = [
   { path: '/dashboard', label: 'dashboard' },
   { path: '/settings/wallet', label: 'settings-wallet' },
   { path: '/settings/notifications', label: 'settings-notifications' },
+  { path: '/partial-failures', heading: /partial failure dashboard/i, label: 'partial-failures' },
 ];
 
 test.describe('accessibility — key screens', () => {
@@ -53,5 +54,36 @@ test.describe('accessibility — key screens', () => {
     // most common "keyboard trap" failure axe reports as `focusable-no-name`.
     expect(focused).not.toBeNull();
     expect((focused as { name: string }).name.length).toBeGreaterThan(0);
+  });
+
+  test('reduced-motion preference disables non-essential animations and transitions', async ({
+    page,
+  }) => {
+    await page.emulateMedia({ reducedMotion: 'reduce' });
+    await page.goto('/', { waitUntil: 'load' });
+
+    const matchesReducedMotion = await page.evaluate(
+      () => window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    );
+    expect(matchesReducedMotion).toBe(true);
+  });
+
+  test('partial failure dashboard filter and sort controls are keyboard and screen-reader accessible', async ({
+    page,
+  }) => {
+    await page.goto('/partial-failures', { waitUntil: 'load' });
+
+    const statusFilter = page.getByLabel('Status');
+    const severityFilter = page.getByLabel('Severity');
+    const searchInput = page.getByLabel('Search');
+
+    await expect(statusFilter).toBeVisible();
+    await expect(severityFilter).toBeVisible();
+    await expect(searchInput).toBeVisible();
+
+    const createdSort = page.getByRole('button', { name: /Created/i });
+    await expect(createdSort).toHaveAttribute('aria-sort', 'descending');
+    await createdSort.click();
+    await expect(createdSort).toHaveAttribute('aria-sort', 'ascending');
   });
 });

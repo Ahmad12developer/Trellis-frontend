@@ -15,14 +15,27 @@ import {
   getTreasuryBalance,
   getTreasuryHistory,
   isProposalApproved,
+  isTimelockExpired,
   getVotingPowerForAccount,
 } from '@/lib/governance/stellar-governance';
 import { calculateQuadraticVotingWeight } from '../utils/quadraticVoting';
 import { ProposalDetailModal } from './ProposalDetailModal';
+import { MultisigTransactionBuilder } from './MultisigTransactionBuilder';
+import { VoteDelegation } from './VoteDelegation';
+import { getNetworkPassphrase } from '@/lib/stellar';
+import { buildTreasurySpendEnvelope } from '@/lib/governance/multisig';
 import {
   verifyStellarAccountSybilResistance,
   type SybilVerificationResult,
 } from '../utils/sybilResistance';
+
+function TimelockCountdown({ executionEta }: { executionEta: string; onExpire?: () => void }) {
+  return (
+    <span className="px-2 py-0.5 rounded text-[10px] bg-amber-500/20 text-amber-300 font-mono">
+      ETA: {new Date(executionEta).toLocaleTimeString()}
+    </span>
+  );
+}
 
 interface GovernanceDashboardProps {
   config: GovernanceConfig;
@@ -31,6 +44,7 @@ interface GovernanceDashboardProps {
   onVote: (proposal: Proposal, choice: VoteChoice) => void;
   onQueue?: (proposal: Proposal) => void;
   onExecute: (proposal: Proposal) => void;
+  onDelegate?: (delegateAddress: string) => Promise<void>;
   isVoting?: boolean;
 }
 
@@ -41,10 +55,12 @@ export function GovernanceDashboard({
   onVote,
   onQueue,
   onExecute,
+  onDelegate,
   isVoting = false,
 }: GovernanceDashboardProps) {
   const { wallet } = useStellarWallet();
   const [selectedProposal, setSelectedProposal] = React.useState<Proposal | null>(null);
+  const [multisigProposal, setMultisigProposal] = React.useState<Proposal | null>(null);
 
   const { data: userVotingPower } = useQuery<{
     tokenBalance: number;
@@ -337,6 +353,15 @@ export function GovernanceDashboard({
                       <span>📊 Compare & Graph</span>
                     </button>
 
+                    {proposal.type === 'treasury_spend' && (
+                      <button
+                        onClick={() => setMultisigProposal(proposal)}
+                        className="px-3 py-1.5 rounded-md border border-indigo-500/50 text-indigo-300 text-xs hover:bg-indigo-500/10 transition-colors"
+                      >
+                        Multi-Sig Signers
+                      </button>
+                    )}
+
                     {approved && proposal.status === 'active' && (
                       <button
                         onClick={() => onExecute(proposal)}
@@ -406,6 +431,43 @@ export function GovernanceDashboard({
           userVotingPower={userVotingPower}
           isVoting={isVoting}
         />
+      )}
+
+      {multisigProposal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md overflow-y-auto">
+          <div className="relative w-full max-w-3xl my-8">
+            <MultisigTransactionBuilder
+              initialXdr={
+                multisigProposal.action?.type === 'treasury_spend' && config.treasuryAccount
+                  ? buildTreasurySpendEnvelope({
+                      networkPassphrase: getNetworkPassphrase(config.network),
+                      treasuryAccount: config.treasuryAccount,
+                      destination: multisigProposal.action.destination,
+                      amount: multisigProposal.action.amount,
+                      memo: multisigProposal.action.memo,
+                    })
+                  : ''
+              }
+              networkPassphrase={getNetworkPassphrase(config.network)}
+              signers={
+                config.treasuryMultisig?.signers || [
+                  multisigProposal.creator,
+                  config.governanceAccount,
+                  config.treasuryAccount,
+                ]
+              }
+              threshold={config.treasuryMultisig?.threshold || 2}
+              treasuryAccount={config.treasuryAccount}
+              proposalId={multisigProposal.id}
+              proposalTitle={multisigProposal.title}
+              onClose={() => setMultisigProposal(null)}
+              onSubmit={async () => {
+                onExecute(multisigProposal);
+                setMultisigProposal(null);
+              }}
+            />
+          </div>
+        </div>
       )}
     </div>
   );

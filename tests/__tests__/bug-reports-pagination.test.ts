@@ -229,5 +229,40 @@ describe("Bug Reports Cursor-based Pagination", () => {
       );
       expect(secondPage.records.map((item) => item.id)).toEqual(["one"]);
     });
+
+    it("returns an empty page when all records after the cursor were deleted", () => {
+      const firstPage = paginateBugReports(
+        [makeReport("three", "2026-01-03"), makeReport("two", "2026-01-02")],
+        { limit: 1 },
+      );
+      const nextPage = paginateBugReports(
+        [makeReport("three", "2026-01-03")],
+        { cursor: firstPage.nextCursor, limit: 1 },
+      );
+
+      expect(nextPage.records).toEqual([]);
+      expect(nextPage.hasMore).toBe(false);
+      expect(nextPage.nextCursor).toBeNull();
+    });
+
+    it("restarts at the first authorized record when the visibility scope changes", () => {
+      const reports = [
+        makeReport("private", "2026-01-03", "submitted", "medium", "functionality", "private-address"),
+        makeReport("shared-2", "2026-01-02", "submitted", "medium", "functionality", "shared-address"),
+        makeReport("shared-1", "2026-01-01", "submitted", "medium", "functionality", "shared-address"),
+      ];
+      const firstPage = paginateBugReports(reports, {
+        limit: 1,
+        visibilityScope: "viewer:admin:policy-v1",
+      });
+      const afterPermissionChange = paginateBugReports(reports, {
+        cursor: firstPage.nextCursor,
+        limit: 1,
+        author: "shared-address",
+        visibilityScope: "viewer:member:policy-v2",
+      });
+
+      expect(afterPermissionChange.records.map((item) => item.id)).toEqual(["shared-2"]);
+    });
   });
 });

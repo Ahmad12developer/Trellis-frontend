@@ -121,6 +121,8 @@ describe("Metric privacy boundary", () => {
 
   it("rejects metrics outside the safe allow-list", () => {
     expect(normalizeMetricPoint(point({ name: "user.email_captured" }))).toBeNull();
+    expect(normalizeMetricPoint(point({ name: "constructor" }))).toBeNull();
+    expect(normalizeMetricPoint(point({ name: "toString" }))).toBeNull();
     expect(normalizeMetricPoint(point())).not.toBeNull();
   });
 

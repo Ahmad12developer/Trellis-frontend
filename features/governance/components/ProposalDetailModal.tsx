@@ -6,7 +6,11 @@ import { compareLinearVsQuadraticVotes } from '../utils/quadraticVoting';
 import { LinearVsQuadraticComparison } from './LinearVsQuadraticComparison';
 import { QuadraticVoteDistributionChart } from './QuadraticVoteDistributionChart';
 import { ProposalExecutionTimeline } from './ProposalExecutionTimeline';
+import { MultisigTransactionBuilder } from './MultisigTransactionBuilder';
+import { getNetworkPassphrase } from '@/lib/stellar';
+import { buildTreasurySpendEnvelope } from '@/lib/governance/multisig';
 import type { SybilVerificationResult } from '../utils/sybilResistance';
+import useFocusTrap from '@/components/useFocusTrap';
 
 interface ProposalDetailModalProps {
   proposal: Proposal;
@@ -31,7 +35,6 @@ export function ProposalDetailModal({
   userVotingPower,
   isVoting = false,
 }: ProposalDetailModalProps) {
-  if (!isOpen) return null;
 
   // Synthesize or extract individual votes
   const votes = useMemo(() => {
@@ -99,11 +102,41 @@ export function ProposalDetailModal({
     });
   }, [votes, proposal, config]);
 
+  const initialXdr = useMemo(() => {
+    if (proposal.action?.type === 'treasury_spend' && config.treasuryAccount) {
+      try {
+        return buildTreasurySpendEnvelope({
+          networkPassphrase: getNetworkPassphrase(config.network),
+          treasuryAccount: config.treasuryAccount,
+          destination: proposal.action.destination,
+          amount: proposal.action.amount,
+          memo: proposal.action.memo,
+        });
+      } catch {
+        return '';
+      }
+    }
+    return '';
+  }, [proposal, config]);
+
   const canVote = proposal.status === 'active';
   const isSybilVerified = userVotingPower?.sybilStatus?.isVerified ?? true;
 
+  const trapRef = useFocusTrap<HTMLDivElement>({
+    active: isOpen,
+    onEscape: onClose,
+  });
+
+  if (!isOpen) return null;
+
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md overflow-y-auto">
+    <div
+      ref={trapRef}
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="proposal-detail-title"
+      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md overflow-y-auto"
+    >
       <div className="relative w-full max-w-4xl bg-[#0e0e15] border border-trellis-vine/50 rounded-2xl shadow-2xl overflow-hidden my-8 max-h-[90vh] flex flex-col">
         {/* Modal Header */}
         <div className="p-6 border-b border-white/10 flex items-start justify-between gap-4 bg-gradient-to-r from-trellis-vine/20 to-transparent">
@@ -135,6 +168,7 @@ export function ProposalDetailModal({
           <button
             onClick={onClose}
             className="p-2 rounded-lg text-gray-400 hover:text-white hover:bg-white/10 transition-colors"
+            aria-label="Close dialog"
           >
             ✕
           </button>
@@ -249,6 +283,27 @@ export function ProposalDetailModal({
 
           {/* On-chain execution audit timeline */}
           <ProposalExecutionTimeline proposal={proposal} network={config.network} />
+
+          {/* Soroban DAO Treasury Multi-Sig Execution */}
+          {proposal.type === 'treasury_spend' && (
+            <div className="pt-2">
+              <MultisigTransactionBuilder
+                initialXdr={initialXdr}
+                networkPassphrase={getNetworkPassphrase(config.network)}
+                signers={
+                  config.treasuryMultisig?.signers || [
+                    proposal.creator,
+                    config.governanceAccount,
+                    config.treasuryAccount,
+                  ]
+                }
+                threshold={config.treasuryMultisig?.threshold || 2}
+                treasuryAccount={config.treasuryAccount}
+                proposalId={proposal.id}
+                proposalTitle={proposal.title}
+              />
+            </div>
+          )}
         </div>
 
         {/* Modal Footer / Voting Actions */}

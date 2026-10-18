@@ -30,11 +30,17 @@ import {
   resetDeprecationWarnings,
   upgradeLoadedRecords,
   upgradeLocalStorageRecords,
+  validateRecordWithGuardrails,
+  guardRecordWrite,
+  guardAPIResponse,
 } from '@/lib/schema-versioning';
 import type {
   Record,
   SchemaDefinition,
   DeprecatedFieldDescriptor,
+  GuardrailOptions,
+  UnknownFieldPolicy,
+  DeprecatedFieldPolicy,
 } from '@/lib/schema-versioning';
 
 describe('Schema Versioning', () => {
@@ -814,6 +820,198 @@ describe('Schema Migration Pipeline (#103)', () => {
       expect(stepWise?.agentTier).toBe(direct?.agentTier);
       expect(stepWise?.previousVersion).toBe(direct?.previousVersion);
       expect(stepWise?.migratedAt).toBeDefined();
+    });
+  });
+
+  describe('Schema Evolution Guardrails', () => {
+    beforeEach(() => {
+      initializeDefaultSchemas();
+      resetDeprecationWarnings();
+      defineSchema({
+        version: '10.0',
+        description: 'Test schema for guardrails',
+        fields: {
+          id: { type: 'string', required: true },
+          schemaVersion: { type: 'string', required: true },
+          name: { type: 'string', required: true },
+          legacyTag: {
+            type: 'string',
+            deprecated: true,
+            replacement: 'tags',
+            removedIn: '11.0',
+          },
+          tags: { type: 'array' },
+        },
+      });
+    });
+
+    describe('Unknown Field Policies', () => {
+      const recordWithUnknown: Record = {
+        id: 'rec-1',
+        schemaVersion: '10.0',
+        name: 'Record 1',
+        unknownProperty: 'unexpected',
+        extraMetadata: { foo: 'bar' },
+      };
+
+      it('preserves unknown fields when unknownFieldPolicy is "preserve"', () => {
+        const result = validateRecordWithGuardrails(recordWithUnknown, {
+          unknownFieldPolicy: 'preserve',
+        });
+
+        expect(result.valid).toBe(true);
+        expect(result.unknownFields).toEqual(['unknownProperty', 'extraMetadata']);
+        expect(result.sanitized.unknownProperty).toBe('unexpected');
+        expect(result.sanitized.extraMetadata).toEqual({ foo: 'bar' });
+      });
+
+      it('strips unknown fields when unknownFieldPolicy is "strip"', () => {
+        const result = validateRecordWithGuardrails(recordWithUnknown, {
+          unknownFieldPolicy: 'strip',
+        });
+
+        expect(result.valid).toBe(true);
+        expect(result.unknownFields).toEqual(['unknownProperty', 'extraMetadata']);
+        expect(result.sanitized.id).toBe('rec-1');
+        expect(result.sanitized.name).toBe('Record 1');
+        expect(result.sanitized.unknownProperty).toBeUndefined();
+        expect(result.sanitized.extraMetadata).toBeUndefined();
+      });
+
+      it('rejects record when unknownFieldPolicy is "reject"', () => {
+        const result = validateRecordWithGuardrails(recordWithUnknown, {
+          unknownFieldPolicy: 'reject',
+        });
+
+        expect(result.valid).toBe(false);
+        expect(result.errors.length).toBeGreaterThan(0);
+        expect(result.errors[0]).toContain('Unknown fields rejected: unknownProperty, extraMetadata');
+      });
+
+      it('quarantines unknown fields when unknownFieldPolicy is "quarantine"', () => {
+        const result = validateRecordWithGuardrails(recordWithUnknown, {
+          unknownFieldPolicy: 'quarantine',
+          quarantineKey: '_quarantined',
+        });
+
+        expect(result.valid).toBe(true);
+        expect(result.sanitized.unknownProperty).toBeUndefined();
+        expect(result.sanitized._quarantined).toEqual({
+          unknownProperty: 'unexpected',
+          extraMetadata: { foo: 'bar' },
+        });
+      });
+    });
+
+    describe('Deprecated Field Policies', () => {
+      const recordWithDeprecated: Record = {
+        id: 'rec-dep',
+        schemaVersion: '10.0',
+        name: 'Record with deprecated field',
+        legacyTag: 'old-tag',
+      };
+
+      it('allows deprecated fields without warnings when deprecatedFieldPolicy is "allow"', () => {
+        const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+        const result = validateRecordWithGuardrails(recordWithDeprecated, {
+          deprecatedFieldPolicy: 'allow',
+          emitWarnings: false,
+        });
+
+        expect(result.valid).toBe(true);
+        expect(result.deprecatedFields).toContain('legacyTag');
+        expect(result.warnings).toHaveLength(0);
+        expect(warnSpy).not.toHaveBeenCalled();
+        warnSpy.restoreAllMocks();
+      });
+
+      it('warns when deprecatedFieldPolicy is "warn"', () => {
+        const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+        const result = validateRecordWithGuardrails(recordWithDeprecated, {
+          deprecatedFieldPolicy: 'warn',
+          emitWarnings: true,
+        });
+
+        expect(result.valid).toBe(true);
+        expect(result.deprecatedFields).toContain('legacyTag');
+        expect(result.warnings.some(w => w.includes('legacyTag'))).toBe(true);
+        expect(warnSpy).toHaveBeenCalled();
+        warnSpy.restoreAllMocks();
+      });
+
+      it('rejects when deprecatedFieldPolicy is "reject"', () => {
+        const result = validateRecordWithGuardrails(recordWithDeprecated, {
+          deprecatedFieldPolicy: 'reject',
+        });
+
+        expect(result.valid).toBe(false);
+        expect(result.errors.some(e => e.includes('Field "legacyTag" is deprecated') && e.includes('rejected'))).toBe(true);
+      });
+    });
+
+    describe('guardRecordWrite', () => {
+      it('successfully prepares and writes clean record', () => {
+        const clean = guardRecordWrite(
+          { id: 'write-1', name: 'Valid Write' },
+          '10.0',
+          { unknownFieldPolicy: 'strip' }
+        );
+
+        expect(clean.id).toBe('write-1');
+        expect(clean.schemaVersion).toBe('10.0');
+        expect(clean.name).toBe('Valid Write');
+      });
+
+      it('throws an error when record violates guardrail policy', () => {
+        expect(() => {
+          guardRecordWrite(
+            { id: 'write-fail', name: 'Has Unknown', badField: 123 },
+            '10.0',
+            { unknownFieldPolicy: 'reject' }
+          );
+        }).toThrow(/Record failed schema guardrails/);
+      });
+    });
+
+    describe('guardAPIResponse', () => {
+      it('strips unknown fields and passes valid API response records by default', () => {
+        const rawApiResponse = [
+          {
+            id: 'api-1',
+            schemaVersion: '10.0',
+            name: 'API Record',
+            internalServerField: 'do_not_leak',
+          },
+          {
+            id: 'api-2',
+            schemaVersion: '1.0',
+            createdAt: 12345678,
+          },
+        ];
+
+        const guarded = guardAPIResponse(rawApiResponse);
+
+        expect(guarded.validCount).toBe(2);
+        expect(guarded.rejectedCount).toBe(0);
+        expect(guarded.data).toHaveLength(2);
+        expect((guarded.data[0] as any).internalServerField).toBeUndefined();
+        expect(guarded.data[0].id).toBe('api-1');
+      });
+
+      it('rejects malformed records or invalid schema versions gracefully without crashing', () => {
+        const dirtyResponse = [
+          null,
+          'not an object',
+          { schemaVersion: '999.0' }, // non-existent schema version
+        ];
+
+        const guarded = guardAPIResponse(dirtyResponse);
+
+        expect(guarded.validCount).toBe(0);
+        expect(guarded.rejectedCount).toBe(3);
+        expect(guarded.errors).toHaveLength(3);
+        expect(guarded.data).toHaveLength(0);
+      });
     });
   });
 });

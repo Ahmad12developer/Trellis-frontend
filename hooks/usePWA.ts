@@ -62,6 +62,7 @@ export function usePWA(): UsePWAReturn {
       isInstallable: pwaManager.isInstallPromptAvailable(),
       isServiceWorkerSupported: pwaManager.isServiceWorkerSupported(),
       isOnline: navigator.onLine,
+      updateAvailable: prev.updateAvailable || pwaManager.hasWaitingWorker(),
       connectionStatus: pwaManager.getConnectionStatus(),
     }));
   }, [pwaManager]);
@@ -69,6 +70,45 @@ export function usePWA(): UsePWAReturn {
   useEffect(() => {
     updateState();
     pwaManager.setupConnectionListeners();
+
+    // Listen for service worker updates and detect waiting worker state
+    let unregisterSwListener: (() => void) | undefined;
+    if (typeof window !== 'undefined' && 'serviceWorker' in navigator) {
+      const sw = navigator.serviceWorker;
+
+      const trackRegistration = (registration: ServiceWorkerRegistration) => {
+        if (registration.waiting) {
+          setState(prev => ({ ...prev, updateAvailable: true }));
+        }
+
+        const handleUpdateFound = () => {
+          const installingWorker = registration.installing;
+          if (installingWorker) {
+            const handleStateChange = () => {
+              if (installingWorker.state === 'installed' && sw.controller) {
+                setState(prev => ({ ...prev, updateAvailable: true }));
+              }
+            };
+            installingWorker.addEventListener('statechange', handleStateChange);
+          }
+        };
+
+        registration.addEventListener('updatefound', handleUpdateFound);
+        return () => {
+          registration.removeEventListener('updatefound', handleUpdateFound);
+        };
+      };
+
+      if (typeof sw.getRegistration === 'function') {
+        sw.getRegistration().then((registration) => {
+          if (registration) {
+            unregisterSwListener = trackRegistration(registration);
+          }
+        }).catch(() => {
+          // ignore registration lookup failure
+        });
+      }
+    }
 
     // Every handler below receives a payload that already validated against
     // the registered schema for its version, so the `as EventListener` casts
@@ -114,6 +154,9 @@ export function usePWA(): UsePWAReturn {
       unsubscribes.forEach((unsubscribe) => unsubscribe());
       window.removeEventListener('online', updateState);
       window.removeEventListener('offline', updateState);
+      if (unregisterSwListener) {
+        unregisterSwListener();
+      }
     };
   }, [pwaManager, updateState]);
 
@@ -130,8 +173,24 @@ export function usePWA(): UsePWAReturn {
   }, [pwaManager]);
 
   const skipWaiting = useCallback(async (): Promise<void> => {
+    let reloaded = false;
+    const reload = () => {
+      if (!reloaded && typeof window !== 'undefined') {
+        reloaded = true;
+        window.location.reload();
+      }
+    };
+
+    if (typeof window !== 'undefined' && 'serviceWorker' in navigator) {
+      navigator.serviceWorker.addEventListener('controllerchange', reload, { once: true });
+    }
+
     await pwaManager.skipWaiting();
     setState(prev => ({ ...prev, updateAvailable: false }));
+
+    if (typeof window !== 'undefined') {
+      setTimeout(reload, 1000);
+    }
   }, [pwaManager]);
 
   const clearCache = useCallback(async (): Promise<void> => {

@@ -67,14 +67,20 @@ describe('Impersonation Manager', () => {
       expect(checkActive()).toBe(false);
     });
 
-    it('should clean up expired sessions', () => {
+    it('should expire sessions without deleting their audit history', () => {
+      jest.useFakeTimers();
       const session1 = startImpersonation('admin1', 'user1', 'read_only', 0.001);
       const session2 = startImpersonation('admin2', 'user2', 'debug');
 
+      jest.advanceTimersByTime(61);
       impersonationManager.clearExpiredSessions();
 
-      expect(getImpersonationSession(session1.id)).toBeNull();
+      expect(getImpersonationSession(session1.id)?.isActive).toBe(false);
+      expect(getImpersonationAuditLog(session1.id).map((event) => event.action)).toContain(
+        'session_expired',
+      );
       expect(getImpersonationSession(session2.id)).toBeDefined();
+      jest.useRealTimers();
     });
   });
 
@@ -138,6 +144,25 @@ describe('Impersonation Manager', () => {
       const auditLog = impersonationManager.getAuditLog(session.id);
       expect(auditLog.length).toBe(2);
       expect(auditLog[1].action).toBe('view_user_data');
+    });
+
+    it('does not expose mutable references to its audit history', () => {
+      const session = startImpersonation('admin1', 'user1', 'read_only');
+      const sessionSnapshot = getImpersonationSession(session.id)!;
+      sessionSnapshot.auditLog[0].action = 'rewritten';
+      sessionSnapshot.auditLog.push({
+        id: 'forged',
+        timestamp: new Date().toISOString(),
+        action: 'forged',
+        resource: 'user:user1',
+        result: 'success',
+      });
+
+      const auditSnapshot = getImpersonationAuditLog(session.id);
+      auditSnapshot[0].action = 'rewritten again';
+      expect(getImpersonationAuditLog(session.id).map((event) => event.action)).toEqual([
+        'session_started',
+      ]);
     });
 
     it('should record blocked action in audit log', () => {

@@ -19,6 +19,10 @@ export interface GovernanceConfig {
   useQuadraticVoting?: boolean;
   minAccountAgeDays?: number;
   minTransactionCount?: number;
+  treasuryMultisig?: {
+    signers: string[];
+    threshold: number;
+  };
 }
 
 export interface ProposalActionUpgradeAgent {
@@ -63,6 +67,7 @@ export interface Proposal {
   startTime: string;
   endTime: string;
   status: ProposalStatus;
+  executionEta?: string;
   action: ProposalAction;
   approvals: number;
   rejections: number;

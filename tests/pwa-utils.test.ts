@@ -66,12 +66,17 @@ const makeRegistration = (overrides: Record<string, unknown> = {}) => ({
   ...overrides,
 });
 
-const stubServiceWorker = (registration: Record<string, unknown>) => {
+const stubServiceWorker = (
+  registration: Record<string, unknown>,
+  swOverrides: Record<string, unknown> = {},
+) => {
   const serviceWorker = {
     register: jest.fn().mockResolvedValue(registration),
     ready: Promise.resolve(registration),
+    getRegistration: jest.fn().mockResolvedValue(registration),
     addEventListener: jest.fn(),
     controller: null,
+    ...swOverrides,
   };
 
   Object.defineProperty(navigator, 'serviceWorker', {
@@ -103,6 +108,11 @@ describe('offline queue serialization', () => {
     expect(restored[1]).toEqual(
       makeSubmission({ id: 'sub-2', url: '/api/feedback', method: 'PUT', attempts: 2 }),
     );
+  });
+
+  it('preserves a detected state conflict across refreshes', () => {
+    const conflicted = makeSubmission({ status: 'conflict', lastError: 'HTTP 412' });
+    expect(deserializeOfflineQueue(serializeOfflineQueue([conflicted]))).toEqual([conflicted]);
   });
 
   it('is tolerant of missing, empty or malformed payloads', () => {
@@ -287,6 +297,30 @@ describe('offline queue replay', () => {
     expect(result.synced).toEqual(['sub-2']);
     expect(result.dropped).toEqual(['sub-1']);
     expect(result.remaining).toBe(0);
+    expect(await queue.size()).toBe(0);
+  });
+
+  it('holds stale-state responses for an explicit retry or discard choice', async () => {
+    const queue = createTestQueue();
+    const submission = await queue.enqueue({
+      url: '/api/loan/repay',
+      headers: { 'If-Match': 'version-4' },
+      body: { amount: '10' },
+    });
+    const fetchMock = jest.fn().mockResolvedValue(jsonResponse(412));
+
+    const result = await flushOfflineQueue(queue, fetchMock as unknown as typeof fetch);
+    const held = (await queue.list())[0];
+
+    expect(result.remaining).toBe(1);
+    expect(held).toMatchObject({ id: submission.id, status: 'conflict', attempts: 0 });
+    expect(held.lastError).toContain('HTTP 412');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    await queue.update(submission.id, { status: 'pending', attempts: 0, lastError: '' });
+    const retryFetch = jest.fn().mockResolvedValue(jsonResponse(204));
+    await flushOfflineQueue(queue, retryFetch as unknown as typeof fetch);
+    expect(retryFetch).toHaveBeenCalledTimes(1);
     expect(await queue.size()).toBe(0);
   });
 
@@ -478,3 +512,173 @@ describe('PWAManager offline submissions', () => {
     expect(await manager.getPendingSubmissionCount()).toBe(0);
   });
 });
+
+describe('PWAManager service worker lifecycle and update handling', () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+    restoreFetch();
+  });
+
+  afterAll(() => {
+    restoreFetch();
+  });
+
+  it('detects a waiting worker on initialization and fires sw-update event', async () => {
+    const waitingWorker = { postMessage: jest.fn() };
+    const registration = makeRegistration({ waiting: waitingWorker });
+    stubServiceWorker(registration, { controller: {} });
+
+    const updates: boolean[] = [];
+    const unsubscribe = subscribeDomainEvent('sw-update', (payload) => {
+      updates.push(payload.available);
+    });
+
+    try {
+      const manager = createFreshManager();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      expect(updates).toEqual([true]);
+      expect(manager.hasWaitingWorker()).toBe(true);
+      expect(manager.getRegistration()).toBe(registration);
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it('detects updatefound and transition to installed state when controller is present', async () => {
+    const listeners: Record<string, Function[]> = {};
+    const registration = {
+      ...makeRegistration(),
+      addEventListener: jest.fn((event: string, cb: Function) => {
+        listeners[event] = listeners[event] || [];
+        listeners[event].push(cb);
+      }),
+      installing: null as any,
+    };
+    stubServiceWorker(registration, { controller: {} });
+
+    const updates: boolean[] = [];
+    const unsubscribe = subscribeDomainEvent('sw-update', (payload) => {
+      updates.push(payload.available);
+    });
+
+    try {
+      createFreshManager();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      // Simulate updatefound with installing worker
+      const workerListeners: Record<string, Function[]> = {};
+      const installingWorker = {
+        state: 'installing',
+        addEventListener: jest.fn((event: string, cb: Function) => {
+          workerListeners[event] = workerListeners[event] || [];
+          workerListeners[event].push(cb);
+        }),
+      };
+      registration.installing = installingWorker;
+
+      // Trigger updatefound
+      listeners['updatefound']?.forEach((cb) => cb());
+
+      // Worker transitions to installed
+      installingWorker.state = 'installed';
+      workerListeners['statechange']?.forEach((cb) => cb());
+
+      expect(updates).toEqual([true]);
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it('does not fire sw-update when installing worker reaches installed on first install (no controller)', async () => {
+    const listeners: Record<string, Function[]> = {};
+    const registration = {
+      ...makeRegistration(),
+      addEventListener: jest.fn((event: string, cb: Function) => {
+        listeners[event] = listeners[event] || [];
+        listeners[event].push(cb);
+      }),
+      installing: null as any,
+    };
+    // No controller on first install
+    stubServiceWorker(registration, { controller: null });
+
+    const updates: boolean[] = [];
+    const unsubscribe = subscribeDomainEvent('sw-update', (payload) => {
+      updates.push(payload.available);
+    });
+
+    try {
+      createFreshManager();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      const workerListeners: Record<string, Function[]> = {};
+      const installingWorker = {
+        state: 'installing',
+        addEventListener: jest.fn((event: string, cb: Function) => {
+          workerListeners[event] = workerListeners[event] || [];
+          workerListeners[event].push(cb);
+        }),
+      };
+      registration.installing = installingWorker;
+      listeners['updatefound']?.forEach((cb) => cb());
+
+      installingWorker.state = 'installed';
+      workerListeners['statechange']?.forEach((cb) => cb());
+
+      expect(updates).toEqual([]);
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it('skipWaiting posts SKIP_WAITING to waiting worker', async () => {
+    const postMessage = jest.fn();
+    const waitingWorker = { postMessage };
+    const registration = makeRegistration({ waiting: waitingWorker });
+    stubServiceWorker(registration, { controller: {} });
+
+    const manager = createFreshManager();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    await manager.skipWaiting();
+    expect(postMessage).toHaveBeenCalledWith({ type: 'SKIP_WAITING' });
+  });
+
+  it('skipWaiting falls back to navigator.serviceWorker.getRegistration when waiting worker is not cached', async () => {
+    const postMessage = jest.fn();
+    const waitingWorker = { postMessage };
+    const freshRegistration = makeRegistration({ waiting: waitingWorker });
+
+    // Initial register returns registration without waiting worker
+    const initialRegistration = makeRegistration({ waiting: null });
+    const serviceWorker = stubServiceWorker(initialRegistration, {
+      controller: {},
+      getRegistration: jest.fn().mockResolvedValue(freshRegistration),
+    });
+
+    const manager = createFreshManager();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect(manager.hasWaitingWorker()).toBe(false);
+
+    await manager.skipWaiting();
+    expect(serviceWorker.getRegistration).toHaveBeenCalled();
+    expect(postMessage).toHaveBeenCalledWith({ type: 'SKIP_WAITING' });
+    expect(manager.hasWaitingWorker()).toBe(true);
+  });
+
+  it('skipWaiting gracefully handles missing waiting worker without error', async () => {
+    const registration = makeRegistration({ waiting: null });
+    stubServiceWorker(registration, {
+      controller: {},
+      getRegistration: jest.fn().mockResolvedValue(registration),
+    });
+
+    const manager = createFreshManager();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    await expect(manager.skipWaiting()).resolves.not.toThrow();
+  });
+});
+

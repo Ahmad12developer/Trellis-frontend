@@ -3,15 +3,18 @@ import crypto from 'crypto';
 export interface WebhookVerificationOptions {
   secret: string;
   maxWindowMs?: number;
+  maxPayloadBytes?: number;
 }
 
 export interface WebhookVerificationResult {
   valid: boolean;
   error?: string;
-  code?: 'MISSING_SIGNATURE' | 'MISSING_TIMESTAMP' | 'INVALID_TIMESTAMP' | 'STALE_TIMESTAMP' | 'DUPLICATE_EVENT' | 'INVALID_SIGNATURE' | 'INVALID_SIGNATURE_FORMAT';
+  code?: 'MISSING_SIGNATURE' | 'MISSING_TIMESTAMP' | 'INVALID_TIMESTAMP' | 'STALE_TIMESTAMP' | 'DUPLICATE_EVENT' | 'INVALID_SIGNATURE' | 'INVALID_SIGNATURE_FORMAT' | 'PAYLOAD_TOO_LARGE' | 'INVALID_EVENT_ID';
 }
 
 const processedEventIds = new Set<string>();
+export const DEFAULT_MAX_WEBHOOK_PAYLOAD_BYTES = 1_048_576;
+const MAX_EVENT_ID_LENGTH = 200;
 
 export function verifyWebhook(
   payload: string,
@@ -27,9 +30,18 @@ export function verifyWebhook(
 
   if (!signature) return { valid: false, error: 'Missing signature', code: 'MISSING_SIGNATURE' };
   if (!timestampStr) return { valid: false, error: 'Missing timestamp', code: 'MISSING_TIMESTAMP' };
+
+  const maxPayloadBytes = options.maxPayloadBytes ?? DEFAULT_MAX_WEBHOOK_PAYLOAD_BYTES;
+  if (Buffer.byteLength(payload, 'utf8') > maxPayloadBytes) {
+    return { valid: false, error: 'Webhook payload exceeds the allowed size', code: 'PAYLOAD_TOO_LARGE' };
+  }
+  if (eventId && eventId.length > MAX_EVENT_ID_LENGTH) {
+    return { valid: false, error: 'Webhook event ID exceeds the allowed size', code: 'INVALID_EVENT_ID' };
+  }
   
-  const timestamp = parseInt(timestampStr, 10);
-  if (isNaN(timestamp)) return { valid: false, error: 'Invalid timestamp', code: 'INVALID_TIMESTAMP' };
+  if (!/^-?\d+$/.test(timestampStr)) return { valid: false, error: 'Invalid timestamp', code: 'INVALID_TIMESTAMP' };
+  const timestamp = Number(timestampStr);
+  if (!Number.isSafeInteger(timestamp)) return { valid: false, error: 'Invalid timestamp', code: 'INVALID_TIMESTAMP' };
 
   const now = Date.now();
   const maxWindow = options.maxWindowMs || 5 * 60 * 1000; // 5 minutes default

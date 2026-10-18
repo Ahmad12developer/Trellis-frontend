@@ -82,15 +82,22 @@ export const RETENTION_POLICY = {
  * Check if a metric is safe to record
  */
 export function isMetricSafe(metricName: string): boolean {
-  return metricName in SAFE_METRICS;
+  return Object.prototype.hasOwnProperty.call(SAFE_METRICS, metricName);
 }
 
 /**
  * Check if a field name is safe to include
  */
 export function isFieldSafe(fieldName: string): boolean {
-  const lowerField = fieldName.toLowerCase();
-  return !BLOCKED_FIELDS.some((blocked) => lowerField.includes(blocked));
+  // Treat snake_case, kebab-case and camelCase spellings as the same field so
+  // `apiKey` cannot slip past a block for `api_key`.
+  const canonicalField = fieldName
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "");
+  return !BLOCKED_FIELDS.some((blocked) =>
+    canonicalField.includes(blocked.replace(/[^a-z0-9]/gi, "").toLowerCase()),
+  );
 }
 
 /**

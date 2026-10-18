@@ -13,6 +13,7 @@ import {
   type LedgerAppConfiguration,
 } from "@/features/wallet/ledger";
 import LedgerPromptGuide from "./LedgerPromptGuide";
+import useFocusTrap from "@/components/useFocusTrap";
 
 export interface LedgerConnectModalProps {
   open: boolean;
@@ -126,10 +127,15 @@ export default function LedgerConnectModal({
     setStep(0);
   }, []);
 
-  if (!open) return null;
-
   const activeAdapter = getActiveLedgerAdapter();
   const webHidSupported = isWebHidSupported();
+
+  const trapRef = useFocusTrap<HTMLDivElement>({
+    active: open,
+    onEscape: onClose,
+  });
+
+  if (!open) return null;
 
   return (
     <div
@@ -140,6 +146,7 @@ export default function LedgerConnectModal({
       }}
     >
       <div
+        ref={trapRef}
         role="dialog"
         aria-modal="true"
         aria-labelledby="ledger-connect-title"

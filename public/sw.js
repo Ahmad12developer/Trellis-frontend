@@ -92,7 +92,6 @@ self.addEventListener('install', (event) => {
     ])
     .then(() => {
       console.log('[SW] Installation completed successfully');
-      return self.skipWaiting();
     })
     .catch(error => {
       console.error('[SW] Installation failed:', error);

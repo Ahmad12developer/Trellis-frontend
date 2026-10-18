@@ -58,12 +58,53 @@ export function isValidVersion(version: string): boolean {
 export type TransformFn = (data: any) => any;
 
 /**
+ * Field definition within a schema
+ */
+export interface FieldDefinition {
+  type: string;
+  required?: boolean;
+  description?: string;
+  deprecated?: boolean;
+  replacement?: string;
+  removedIn?: SchemaVersion;
+}
+
+/**
+ * Policy for handling unknown/unrecognized fields
+ * - 'strip': removes unknown fields from the sanitized output (safe for forwarding)
+ * - 'reject': marks validation as failed and records an error
+ * - 'preserve': retains unknown fields as-is
+ * - 'quarantine': separates unknown fields into an `_unknown` or quarantine bag
+ */
+export type UnknownFieldPolicy = 'strip' | 'reject' | 'preserve' | 'quarantine';
+
+/**
+ * Policy for handling deprecated fields
+ * - 'allow': accepts deprecated fields without warnings or errors
+ * - 'warn': emits deprecation warning / records warning, but keeps valid
+ * - 'reject': marks validation as failed if deprecated fields are present
+ */
+export type DeprecatedFieldPolicy = 'allow' | 'warn' | 'reject';
+
+/**
+ * Options for schema evolution guardrails
+ */
+export interface GuardrailOptions {
+  unknownFieldPolicy?: UnknownFieldPolicy;
+  deprecatedFieldPolicy?: DeprecatedFieldPolicy;
+  /** Custom quarantine key when policy is 'quarantine'. Defaults to '_quarantined' */
+  quarantineKey?: string;
+  /** Whether to log warnings via console.warn. Defaults to true */
+  emitWarnings?: boolean;
+}
+
+/**
  * Schema definition with transforms
  */
 export interface SchemaDefinition {
   version: SchemaVersion;
   description: string;
-  fields: Record<string, { type: string; required?: boolean; description?: string }>;
+  fields: Record<string, FieldDefinition | { type: string; required?: boolean; description?: string }>;
   /** Transform to convert from previous version */
   transformFrom?: (previousVersion: SchemaVersion, data: any) => any;
   /** Transform before writing to this version */
@@ -663,12 +704,41 @@ export function normalizeRecord(record: Record): Record {
 }
 
 /**
- * Validate record matches schema for its version
+ * Result of schema guardrail validation
  */
-export function validateRecord(record: Record): {
+export interface GuardrailValidationResult {
   valid: boolean;
   errors: string[];
-} {
+  warnings: string[];
+  unknownFields: string[];
+  deprecatedFields: string[];
+  sanitized: Record;
+}
+
+/**
+ * Known system metadata fields that are always allowed on records
+ */
+export const SYSTEM_METADATA_FIELDS = new Set<string>([
+  'id',
+  'schemaVersion',
+  'migratedAt',
+  'previousVersion',
+]);
+
+/**
+ * Validate record against its schema version with configurable evolution guardrails
+ */
+export function validateRecordWithGuardrails(
+  record: Record,
+  options: GuardrailOptions = {}
+): GuardrailValidationResult {
+  const {
+    unknownFieldPolicy = 'preserve',
+    deprecatedFieldPolicy = 'warn',
+    quarantineKey = '_quarantined',
+    emitWarnings = true,
+  } = options;
+
   const version = record.schemaVersion || '1.0';
   const schema = catalog.getSchema(version);
 
@@ -676,10 +746,17 @@ export function validateRecord(record: Record): {
     return {
       valid: false,
       errors: [`Schema version ${version} not found`],
+      warnings: [],
+      unknownFields: [],
+      deprecatedFields: [],
+      sanitized: { ...record },
     };
   }
 
   const errors: string[] = [];
+  const warnings: string[] = [];
+  const unknownFields: string[] = [];
+  const deprecatedFieldsFound: string[] = [];
 
   // Check required fields
   for (const [fieldName, fieldDef] of Object.entries(schema.fields)) {
@@ -688,9 +765,190 @@ export function validateRecord(record: Record): {
     }
   }
 
+  // Detect unknown and deprecated fields
+  const definedFields = new Set<string>(Object.keys(schema.fields));
+
+  for (const key of Object.keys(record)) {
+    if (SYSTEM_METADATA_FIELDS.has(key)) {
+      continue;
+    }
+
+    const isDefined = definedFields.has(key);
+    const fieldDef = isDefined ? (schema.fields[key] as FieldDefinition) : null;
+    const globalDeprecation = getDeprecatedField(key);
+    const isDeprecated = (fieldDef && fieldDef.deprecated) || !!globalDeprecation;
+
+    if (!isDefined) {
+      unknownFields.push(key);
+    }
+
+    if (isDeprecated) {
+      deprecatedFieldsFound.push(key);
+    }
+  }
+
+  // Handle unknown fields policy
+  if (unknownFields.length > 0) {
+    if (unknownFieldPolicy === 'reject') {
+      errors.push(`Unknown fields rejected: ${unknownFields.join(', ')}`);
+    } else if (unknownFieldPolicy === 'strip') {
+      warnings.push(`Stripped unknown fields: ${unknownFields.join(', ')}`);
+    } else if (unknownFieldPolicy === 'quarantine') {
+      warnings.push(`Quarantined unknown fields under "${quarantineKey}": ${unknownFields.join(', ')}`);
+    }
+  }
+
+  // Handle deprecated fields policy
+  if (deprecatedFieldsFound.length > 0) {
+    for (const depField of deprecatedFieldsFound) {
+      const def = (schema.fields[depField] as FieldDefinition) || undefined;
+      const globalDesc = getDeprecatedField(depField);
+      const replacement = def?.replacement || globalDesc?.replacement;
+      const removedIn = def?.removedIn || globalDesc?.removedIn;
+
+      let msg = `Field "${depField}" is deprecated`;
+      if (replacement) {
+        msg += ` (replacement: "${replacement}")`;
+      }
+      if (removedIn) {
+        msg += ` and scheduled for removal in schema ${removedIn}`;
+      }
+
+      if (deprecatedFieldPolicy === 'reject') {
+        errors.push(`${msg} and rejected by guardrail policy`);
+      } else if (deprecatedFieldPolicy === 'warn') {
+        warnings.push(msg);
+        if (emitWarnings) {
+          console.warn(`[schema-guardrails] ${msg}`);
+        }
+      }
+    }
+  }
+
+  // Build sanitized object based on unknownFieldPolicy
+  let sanitized: Record = { ...record };
+
+  if (unknownFieldPolicy === 'strip') {
+    sanitized = {} as Record;
+    for (const key of Object.keys(record)) {
+      if (SYSTEM_METADATA_FIELDS.has(key) || definedFields.has(key)) {
+        sanitized[key] = record[key];
+      }
+    }
+  } else if (unknownFieldPolicy === 'quarantine') {
+    sanitized = {} as Record;
+    const quarantined: Record<string, any> = {};
+    for (const key of Object.keys(record)) {
+      if (SYSTEM_METADATA_FIELDS.has(key) || definedFields.has(key)) {
+        sanitized[key] = record[key];
+      } else {
+        quarantined[key] = record[key];
+      }
+    }
+    sanitized[quarantineKey] = quarantined;
+  }
+
   return {
     valid: errors.length === 0,
     errors,
+    warnings,
+    unknownFields,
+    deprecatedFields: deprecatedFieldsFound,
+    sanitized,
+  };
+}
+
+/**
+ * Validate record matches schema for its version (backward compatible)
+ */
+export function validateRecord(record: Record): {
+  valid: boolean;
+  errors: string[];
+} {
+  const result = validateRecordWithGuardrails(record, {
+    unknownFieldPolicy: 'preserve',
+    deprecatedFieldPolicy: 'allow',
+    emitWarnings: false,
+  });
+
+  return {
+    valid: result.valid,
+    errors: result.errors,
+  };
+}
+
+/**
+ * Guardrail-enforced record write: prepares, applies guardrails, and returns sanitized record.
+ * Throws an Error if validation fails.
+ */
+export function guardRecordWrite(
+  data: any,
+  version?: SchemaVersion,
+  options: GuardrailOptions = {}
+): Record {
+  const prepared = prepareRecordForWrite(data, version);
+  const guardResult = validateRecordWithGuardrails(prepared, options);
+
+  if (!guardResult.valid) {
+    throw new Error(`Record failed schema guardrails: ${guardResult.errors.join('; ')}`);
+  }
+
+  return guardResult.sanitized;
+}
+
+/**
+ * Guardrail-enforced API response processor.
+ * Validates, normalizes, and applies guardrails to public API responses.
+ */
+export function guardAPIResponse<T extends Record>(
+  responses: any | any[],
+  options: GuardrailOptions = { unknownFieldPolicy: 'strip', deprecatedFieldPolicy: 'warn' }
+): {
+  data: T[];
+  validCount: number;
+  rejectedCount: number;
+  errors: string[];
+  warnings: string[];
+} {
+  const list = Array.isArray(responses) ? responses : [responses];
+  const data: T[] = [];
+  const errors: string[] = [];
+  const warnings: string[] = [];
+  let validCount = 0;
+  let rejectedCount = 0;
+
+  for (const raw of list) {
+    if (!raw || typeof raw !== 'object') {
+      rejectedCount++;
+      errors.push('Invalid response record: must be a non-null object');
+      continue;
+    }
+
+    const normalized = readRecord(raw, true);
+    if (!normalized) {
+      rejectedCount++;
+      errors.push(`Failed to read/normalize record with version ${raw.schemaVersion || 'unspecified'}`);
+      continue;
+    }
+
+    const guardResult = validateRecordWithGuardrails(normalized, options);
+    if (!guardResult.valid) {
+      rejectedCount++;
+      errors.push(...guardResult.errors);
+      continue;
+    }
+
+    validCount++;
+    warnings.push(...guardResult.warnings);
+    data.push(guardResult.sanitized as T);
+  }
+
+  return {
+    data,
+    validCount,
+    rejectedCount,
+    errors,
+    warnings,
   };
 }
 
