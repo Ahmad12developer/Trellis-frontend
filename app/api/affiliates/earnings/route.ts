@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getEarningsHistory, isValidStellarAddress } from '@/lib/affiliate-store';
+import { createProblemResponse } from '@/lib/api-contracts/problem-details';
 
 /**
  * GET /api/affiliates/earnings?wallet=<address>&days=<number>
@@ -14,34 +15,24 @@ export async function GET(request: NextRequest) {
     const days = daysParam ? parseInt(daysParam, 10) : 30;
 
     if (!wallet) {
-      return NextResponse.json(
-        { error: 'Wallet address required' },
-        { status: 400 }
-      );
+      return createProblemResponse('WALLET_REQUIRED', { instance: request.nextUrl.pathname });
     }
 
     // Validate Stellar address format
     if (!isValidStellarAddress(wallet)) {
-      return NextResponse.json(
-        { error: 'Invalid Stellar address format' },
-        { status: 400 }
-      );
+      return createProblemResponse('INVALID_WALLET_ADDRESS', { instance: request.nextUrl.pathname });
     }
 
     // Validate days parameter
     if (isNaN(days) || days < 1 || days > 365) {
-      return NextResponse.json(
-        { error: 'Days must be between 1 and 365' },
-        { status: 400 }
-      );
+      return createProblemResponse('INVALID_RANGE', { instance: request.nextUrl.pathname });
     }
 
     return NextResponse.json(getEarningsHistory(wallet, days));
   } catch (error) {
+    // Raw errors stay in protected logs; the response carries only the
+    // registry-sanitized message and a correlation id.
     console.error('Error fetching earnings history:', error);
-    return NextResponse.json(
-      { error: 'Internal server error' },
-      { status: 500 }
-    );
+    return createProblemResponse('INTERNAL_ERROR', { instance: request.nextUrl.pathname });
   }
 }

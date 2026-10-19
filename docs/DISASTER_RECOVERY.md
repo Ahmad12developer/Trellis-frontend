@@ -138,3 +138,14 @@ When a disaster recovery validation check fails, maintainers must adhere to the 
 - The validator opens datasets in **read-only** mode.
 - No writes, updates, deletions, or schema changes are ever issued to databases or files.
 - The command can be safely re-run repeatedly in production staging environments before releasing maintenance mode locks.
+
+---
+
+## 🔗 Related Verification
+
+- `validate:invariants` checks critical data only. Use `npm run restore:verify`
+  before cutover to also rebuild and reconcile derived indexes (payout totals,
+  referral-code ownership, referral counts, execution rollups). See
+  [`docs/SNAPSHOT_RESTORE_VERIFICATION.md`](./SNAPSHOT_RESTORE_VERIFICATION.md).
+- Use `npm run monitor:invariants` for continuous drift detection after the
+  restore is live; see [`docs/INVARIANT_MONITORING.md`](./INVARIANT_MONITORING.md).

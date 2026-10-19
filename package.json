@@ -22,6 +22,8 @@
     "validate:a11y": "node scripts/verify-a11y-regressions.mjs",
     "validate:invariants": "node scripts/validate-domain-invariants.mjs",
     "dr:validate": "node scripts/validate-domain-invariants.mjs",
+    "restore:verify": "tsx scripts/verify-snapshot-restore.ts",
+    "monitor:invariants": "tsx scripts/monitor-invariants.ts",
     "monitor:invariants": "tsx scripts/validate-domain-events.ts && tsx scripts/monitor-invariants.ts",
     "validate:events": "tsx scripts/validate-domain-events.ts",
     "drill:verify": "node scripts/incident-drill.mjs",
