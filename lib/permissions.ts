@@ -801,6 +801,47 @@ export function getAllowedActions(role: Role, scope: Scope = 'global'): Action[]
   return ACTIONS.filter((action) => isGranted(action, { role, resourceScope: scope }));
 }
 
+export interface PermissionDiffChange {
+  action: Action;
+  description: string;
+  change: 'granted' | 'revoked' | 'modified';
+  before: PermissionEntry;
+  after: PermissionEntry;
+}
+
+/**
+ * Preview the effective permission changes between two role assignments.
+ * This is a read-only report: callers must still authorize and persist any
+ * eventual role or policy change through its own mutation path.
+ */
+export function buildPermissionDiff(
+  beforeRole: Role,
+  afterRole: Role,
+  scope: Scope = 'project',
+): PermissionDiffChange[] {
+  return ACTIONS.flatMap((action) => {
+    const before = getPermissionEntry(action, beforeRole);
+    const after = getPermissionEntry(action, afterRole);
+    const beforePolicy = { effect: before.effect, scope: before.scope, conditions: before.conditions };
+    const afterPolicy = { effect: after.effect, scope: after.scope, conditions: after.conditions };
+    if (JSON.stringify(beforePolicy) === JSON.stringify(afterPolicy)) return [];
+
+    const beforeGranted = isGranted(action, { role: beforeRole, resourceScope: scope });
+    const afterGranted = isGranted(action, { role: afterRole, resourceScope: scope });
+    return [{
+      action,
+      description: describeAction(action),
+      change: !beforeGranted && afterGranted
+        ? 'granted' as const
+        : beforeGranted && !afterGranted
+          ? 'revoked' as const
+          : 'modified' as const,
+      before,
+      after,
+    }];
+  });
+}
+
 export function describeAction(action: Action): string {
   return MATRIX[action].description;
 }
