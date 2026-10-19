@@ -88,6 +88,135 @@ This document specifies the contract definitions, request/response formats, auth
 
 ---
 
+
+---
+
+### 4. Bug Reports & Cursor Pagination
+
+#### `GET /api/bug-reports`
+- **Description**: Returns paginated bug reports supporting cursor-based pagination and status filtering.
+- **Auth**: None (or optional actor context)
+- **Query Params**:
+  - `cursor` (optional, string): Opaque forward pagination cursor from `nextCursor`.
+  - `limit` (optional, integer, default: 20, max: 50): Page size boundary.
+  - `status` (optional, string): `open` | `in_progress` | `resolved` | `closed`.
+- **Response Format (200 OK)**:
+```json
+{
+  "reports": [
+    {
+      "id": "br_1234567890_abc",
+      "title": "Simulation timeout on mainnet",
+      "description": "Details regarding timeout...",
+      "status": "open",
+      "severity": "medium",
+      "createdAt": "2026-10-18T12:00:00.000Z",
+      "updatedAt": "2026-10-18T12:00:00.000Z"
+    }
+  ],
+  "nextCursor": "br_1234567890_abc",
+  "hasMore": false,
+  "total": 1
+}
+```
+
+---
+
+### 5. Retry & Dead-Letter Queue Management
+
+#### `GET /api/retry/dead-letters`
+- **Description**: Lists terminal operation failures recorded in the bounded dead-letter queue.
+- **Auth**: Bearer token validated against `DEAD_LETTER_ADMIN_TOKEN`.
+- **Query Params**:
+  - `reason` (optional, string): `retries_exhausted` | `non_retryable` | `abandoned`
+  - `operationClass` (optional, string): `transaction` | `sync` | `webhook` | `import` | `export` | `background_job` | `http_request` | `rpc`
+  - `operationId` (optional, string): Filter by specific operation ID.
+  - `includeResolved` (optional, boolean, default: `false`): Include triaged records.
+  - `limit` (optional, integer, default: 50, max: 200): Record count boundary.
+- **Response Format (200 OK)**:
+```json
+{
+  "records": [
+    {
+      "id": "dlq_abcd1234_xyz",
+      "operationClass": "transaction",
+      "operationId": "tx-10492",
+      "reason": "retries_exhausted",
+      "classification": {
+        "kind": "network_transient",
+        "retryable": true,
+        "suggestedBackoffMs": 5000
+      },
+      "attempts": [
+        {
+          "attempt": 0,
+          "startedAt": "2026-10-18T10:00:00.000Z",
+          "durationMs": 150,
+          "classification": { "kind": "network_transient", "retryable": true }
+        }
+      ],
+      "attemptsCount": 1,
+      "firstFailedAt": "2026-10-18T10:00:00.000Z",
+      "deadLetteredAt": "2026-10-18T10:05:00.000Z",
+      "context": { "wallet": "GB..." }
+    }
+  ],
+  "stats": {
+    "total": 1,
+    "unresolved": 1,
+    "resolved": 0,
+    "dropped": 0
+  }
+}
+```
+
+#### `POST /api/retry/dead-letters`
+- **Description**: Triages or replays a dead-letter record with strict idempotency and double-resolution prevention.
+- **Auth**: Bearer token validated against `DEAD_LETTER_ADMIN_TOKEN`.
+- **Request Body**:
+```json
+{
+  "id": "dlq_abcd1234_xyz",
+  "outcome": "replayed",
+  "notes": "Re-executed after network recovery"
+}
+```
+- **Response Format (200 OK)**:
+```json
+{
+  "success": true,
+  "record": {
+    "id": "dlq_abcd1234_xyz",
+    "resolution": "replayed",
+    "resolutionNotes": "Re-executed after network recovery",
+    "resolvedAt": "2026-10-18T10:15:00.000Z"
+  }
+}
+```
+
+---
+
+### 6. Streaming Data Export & Authorization Boundaries
+
+#### `POST /api/export`
+- **Description**: Generates streaming CSV/JSON export for authorized actors within retention boundaries.
+- **Auth**: Matrix authorization via actor bearer token (`action: "export_data"`). Minimum required role is `contributor` for own resources, `maintainer` for project resources.
+- **Request Body**:
+```json
+{
+  "wallet": "GBBDES777NN7VUXK4G576WJW7S5U76EOMSKJEXL567WZ5H5R2V73TEST",
+  "type": "simulations",
+  "from": "2026-08-01T00:00:00.000Z",
+  "to": "2026-10-18T00:00:00.000Z",
+  "format": "json"
+}
+```
+- **Response Format (200 OK)**: Streaming chunks with `Content-Type: application/json` or `text/csv`.
+- **Error Responses**:
+  - `401 Unauthorized`: Missing or malformed authentication header.
+  - `403 Forbidden`: Insufficient role permissions (`denied_by_policy`).
+  - `422 Unprocessable Entity`: Requested date range exceeds data type retention window.
+
 ## Cross-Service Contract Map: Domain Events & Integration Boundaries
 
 This section is the authoritative map of domain events that cross service boundaries in the Trellis system. Every event has exactly one producer and one or more consumers. The map is enforced by `___tests___/contracts/domain-events.test.ts` (see %Contract Verification% below).
@@ -153,6 +282,32 @@ All domain events are transported as JSON objects with the following envelope. T
 | Version major mismatch | Consumer sees major bump without support | Reject and alert; require consumer upgrade |
 | Dead-letter queue growing | Queue depth monitor alert | Operator investigates and replays after fix |
 | Consumer down for extended period | Health check fails | Events buffer in queue; replay on recovery |
+
+
+### Contract Boundary & Resilience Matrix
+
+| Boundary | Normal Behavior | Edge Case / Threshold | Failure Code / Action | Recovery Runbook |
+|---|---|---|---|---|
+| **Cursor Pagination** | Returns `reports[]` + `nextCursor` | Terminal page returns `hasMore: false` and `nextCursor: null` | Invalid cursor falls back to first page or returns 400 | Re-query with initial empty cursor |
+| **Dead-Letter Limit** | Returns up to `limit` records | Upper bound enforced at `limit <= 200`; non-integer/negative rejected | `400 invalid_limit` | Clamp client page request to `1 <= limit <= 200` |
+| **Dead-Letter Filter** | Filters by valid reason & registered `OperationClass` | Unregistered class or unrecognized reason | `400 invalid_reason` / `400 invalid_operation_class` | Verify against `OPERATION_CLASSES` registry |
+| **Dead-Letter Secret** | Constant-time token match | Secret missing on server | `503 not_configured` (Fails closed) | Configure `DEAD_LETTER_ADMIN_TOKEN` secret in environment |
+| **Export Role Gate** | Permits `contributor`, `maintainer`, `admin` | `viewer` or unauthorized role | `403 denied_by_policy` | Elevate role or obtain action-scoped capability token |
+| **Export Retention** | Streams data within retention bounds | `from` > `to` or range exceeds `RETENTION_DAYS` (simulations: 365d, analytics: 730d, telemetry: 90d) | `422 Unprocessable Entity` | Narrow date window within retention limits |
+| **DLQ Double Resolution** | Marks record `replayed` or `discarded` | Resolving an already-resolved record | `409 Conflict` | Fetch fresh DLQ status; confirm resolution notes |
+
+### Dead-Letter Queue Replay & Rollback Runbook
+
+1. **Triage Inspection**:
+   Query `GET /api/retry/dead-letters?limit=50&includeResolved=false` using an authorized admin token.
+2. **Root Cause Analysis**:
+   Inspect `classification.kind` (`network_transient`, `rate_limited`, `permanent`, etc.) and `attempts[]` duration/history.
+3. **Idempotent Replay**:
+   Submit `POST /api/retry/dead-letters` with `outcome: "replayed"`. If underlying operation is retryable, execute with original `operationId`.
+4. **Resolution Conflict Handling**:
+   If a `409 Conflict` is returned, another maintainer or process has already resolved the record. Inspect `record.resolution` and `record.resolutionNotes`.
+5. **Discarding Non-Viable Operations**:
+   If payload or underlying transaction cannot succeed, resolve with `outcome: "discarded"` and document reasoning in `notes`.
 
 ### Rollback / Recovery Steps
 

@@ -235,7 +235,7 @@ describe('actor identity', () => {
       const viewerToken = await issueActorToken({ id: 'vic', role: 'viewer' });
       const request = new NextRequest('https://example.test/api/permissions/capability', {
         method: 'POST',
-        headers: { authorization: `******, 'content-type': 'application/json' },
+        headers: { authorization: `Bearer ${viewerToken}`, 'content-type': 'application/json' },
         body: JSON.stringify({ action, dryRun: false }),
       });
       const response = await capabilityPOST(request);
@@ -449,7 +449,7 @@ describe('route-level enforcement', () => {
       const token = await issueActorToken({ id: 'alice', role: 'admin' });
       const issueRequest = new NextRequest('https://example.test/api/permissions/capability', {
         method: 'POST',
-        headers: { authorization: `******, 'content-type': 'application/json' },
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
         body: JSON.stringify({
           action: 'run_retention_cleanup',
           dryRun: false,
@@ -476,7 +476,7 @@ describe('route-level enforcement', () => {
       const token = await issueActorToken({ id: 'alice', role: 'admin' });
       const issueRequest = new NextRequest('https://example.test/api/permissions/capability', {
         method: 'POST',
-        headers: { authorization: `******, 'content-type': 'application/json' },
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
         body: JSON.stringify({
           action: 'run_retention_cleanup',
           dryRun: false,
