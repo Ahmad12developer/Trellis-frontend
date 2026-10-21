@@ -20,6 +20,7 @@ import {
 import { parseActionParam, requirePermission } from '@/lib/auth/guard';
 import { ACTIONS, ROLES } from '@/lib/permissions';
 import { GET as permissionsGET } from '@/app/api/permissions/route';
+import { POST as permissionsDiffPOST } from '@/app/api/permissions/diff/route';
 import { GET as telemetryGET } from '@/app/api/telemetry/session/route';
 import { POST as securityPOST } from '@/app/api/security/route';
 import { POST as capabilityPOST } from '@/app/api/permissions/capability/route';
@@ -335,6 +336,37 @@ describe('route-level enforcement', () => {
       );
       expect(status).toBe(400);
       expect(body.error).toBe('invalid_action');
+    });
+  });
+
+  describe('POST /api/permissions/diff', () => {
+    it('returns a no-store preview to a maintainer without changing any role', async () => {
+      const token = await issueActorToken({ id: 'mona', role: 'maintainer' });
+      const response = await permissionsDiffPOST(new NextRequest('https://example.test/api/permissions/diff', {
+        method: 'POST',
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ fromRole: 'viewer', toRole: 'maintainer', scope: 'project' }),
+      }));
+      const { status, body } = await readStatus(response);
+
+      expect(status).toBe(200);
+      expect(response.headers.get('cache-control')).toBe('no-store');
+      expect(body.fromRole).toBe('viewer');
+      expect(body.toRole).toBe('maintainer');
+      expect(body.changes).toEqual(expect.arrayContaining([
+        expect.objectContaining({ action: 'import_data', change: 'granted' }),
+      ]));
+    });
+
+    it('rejects a viewer who cannot inspect the permission matrix', async () => {
+      const token = await issueActorToken({ id: 'vic', role: 'viewer' });
+      const { status, body } = await readStatus(await permissionsDiffPOST(new NextRequest('https://example.test/api/permissions/diff', {
+        method: 'POST',
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ fromRole: 'viewer', toRole: 'admin' }),
+      })));
+      expect(status).toBe(403);
+      expect(body.error.code).toBe('denied_by_policy');
     });
   });
 
