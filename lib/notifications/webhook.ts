@@ -4,6 +4,8 @@ export interface WebhookVerificationOptions {
   secret: string;
   maxWindowMs?: number;
   maxPayloadBytes?: number;
+  /** Injectable clock for deterministic replay-window checks. */
+  now?: () => number;
 }
 
 export interface WebhookVerificationResult {
@@ -12,9 +14,10 @@ export interface WebhookVerificationResult {
   code?: 'MISSING_SIGNATURE' | 'MISSING_TIMESTAMP' | 'INVALID_TIMESTAMP' | 'STALE_TIMESTAMP' | 'DUPLICATE_EVENT' | 'INVALID_SIGNATURE' | 'INVALID_SIGNATURE_FORMAT' | 'PAYLOAD_TOO_LARGE' | 'INVALID_EVENT_ID';
 }
 
-const processedEventIds = new Set<string>();
+const processedEventIds = new Map<string, number>();
 export const DEFAULT_MAX_WEBHOOK_PAYLOAD_BYTES = 1_048_576;
 const MAX_EVENT_ID_LENGTH = 200;
+const MAX_PROCESSED_WEBHOOKS = 10_000;
 
 export function verifyWebhook(
   payload: string,
@@ -43,15 +46,23 @@ export function verifyWebhook(
   const timestamp = Number(timestampStr);
   if (!Number.isSafeInteger(timestamp)) return { valid: false, error: 'Invalid timestamp', code: 'INVALID_TIMESTAMP' };
 
-  const now = Date.now();
-  const maxWindow = options.maxWindowMs || 5 * 60 * 1000; // 5 minutes default
+  const now = options.now?.() ?? Date.now();
+  const maxWindow = options.maxWindowMs ?? 5 * 60 * 1000; // 5 minutes default
 
   if (Math.abs(now - timestamp) > maxWindow) {
     return { valid: false, error: 'Webhook timestamp is outside the allowed window', code: 'STALE_TIMESTAMP' };
   }
 
-  if (eventId) {
-    if (processedEventIds.has(eventId)) {
+  // Event IDs are scoped to the signing secret so independent webhook senders
+  // cannot suppress each other's events by reusing an ID. The secret itself is
+  // never retained; only a short digest is used in the in-memory key.
+  const secretScope = crypto.createHash('sha256').update(options.secret).digest('hex').slice(0, 16);
+  const processedKey = eventId ? `${secretScope}:${eventId}` : undefined;
+  if (processedKey) {
+    for (const [key, expiresAt] of processedEventIds) {
+      if (expiresAt <= now) processedEventIds.delete(key);
+    }
+    if (processedEventIds.has(processedKey)) {
       return { valid: false, error: 'Duplicate webhook event', code: 'DUPLICATE_EVENT' };
     }
   }
@@ -75,15 +86,16 @@ export function verifyWebhook(
     return { valid: false, error: 'Signature verification failed', code: 'INVALID_SIGNATURE_FORMAT' };
   }
 
-  if (eventId) {
-    processedEventIds.add(eventId);
-    // basic cleanup to prevent memory leak
-    if (processedEventIds.size > 10000) {
-      const iter = processedEventIds.values();
-      for (let i = 0; i < 1000; i++) {
-        processedEventIds.delete(iter.next().value as string);
-      }
+  if (processedKey) {
+    if (processedEventIds.size >= MAX_PROCESSED_WEBHOOKS) {
+      const oldest = [...processedEventIds.entries()]
+        .sort((left, right) => left[1] - right[1])
+        .slice(0, Math.ceil(MAX_PROCESSED_WEBHOOKS * 0.1));
+      oldest.forEach(([key]) => processedEventIds.delete(key));
     }
+    // Dedupe retention matches the signature replay window. Expired timestamps
+    // are rejected independently, so retaining their IDs longer adds no safety.
+    processedEventIds.set(processedKey, now + maxWindow);
   }
 
   return { valid: true };

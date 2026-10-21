@@ -47,9 +47,11 @@ export type LifecycleDispatchEvent = Omit<
 
 class LifecycleNotificationManager {
   private notifications: Map<string, LifecycleNotification> = new Map();
-  private dedupKeys: Set<string> = new Set();
+  private dedupKeys: Map<string, number> = new Map();
   private auditLog: NotificationAuditRecord[] = [];
   private readonly maxAuditLogSize = 1000;
+  private readonly dedupWindowMs = 24 * 60 * 60 * 1000;
+  private readonly maxDedupKeys = 10_000;
 
   /**
    * Dispatch a lifecycle notification.
@@ -65,11 +67,14 @@ class LifecycleNotificationManager {
     event: LifecycleDispatchEvent,
     options: DispatchOptions = {}
   ): DispatchResult {
+    const dispatchTime = options.now ?? new Date();
+    const nowMs = dispatchTime.getTime();
     const dedupKey =
       event.dedupKey ||
       `${event.type}_${event.recipientWallet || 'all'}_${event.title}_${JSON.stringify(event.metadata || {})}`;
 
-    if (this.dedupKeys.has(dedupKey)) {
+    this.pruneDedupKeys(nowMs);
+    if ((this.dedupKeys.get(dedupKey) ?? 0) > nowMs) {
       return { notification: null, isDuplicate: true };
     }
 
@@ -83,13 +88,13 @@ class LifecycleNotificationManager {
       audience: event.audience || 'user',
       isRead: false,
       dismissed: false,
-      createdAt: new Date().toISOString(),
+      createdAt: dispatchTime.toISOString(),
       isMandatory: mandatory,
     };
 
     if (options.bypassPreferences) {
       this.notifications.set(id, baseNotification);
-      this.dedupKeys.add(dedupKey);
+      this.rememberDedupKey(dedupKey, nowMs);
       return {
         notification: baseNotification,
         isDuplicate: false,
@@ -115,7 +120,7 @@ class LifecycleNotificationManager {
 
     if (decision.shouldDeliver) {
       this.notifications.set(id, finalNotification);
-      this.dedupKeys.add(dedupKey);
+      this.rememberDedupKey(dedupKey, nowMs);
       return {
         notification: finalNotification,
         isDuplicate: false,
@@ -125,7 +130,7 @@ class LifecycleNotificationManager {
     }
 
     // Suppressed optional notification: record dedupKey so duplicate triggers are caught
-    this.dedupKeys.add(dedupKey);
+    this.rememberDedupKey(dedupKey, nowMs);
     return {
       notification: null,
       isDuplicate: false,
@@ -262,6 +267,22 @@ class LifecycleNotificationManager {
     this.notifications.clear();
     this.dedupKeys.clear();
     this.auditLog = [];
+  }
+
+  private pruneDedupKeys(nowMs: number): void {
+    for (const [key, expiresAt] of this.dedupKeys) {
+      if (expiresAt <= nowMs) this.dedupKeys.delete(key);
+    }
+  }
+
+  private rememberDedupKey(key: string, nowMs: number): void {
+    if (this.dedupKeys.size >= this.maxDedupKeys) {
+      const oldest = [...this.dedupKeys.entries()]
+        .sort((left, right) => left[1] - right[1])
+        .slice(0, Math.ceil(this.maxDedupKeys * 0.1));
+      oldest.forEach(([expiredKey]) => this.dedupKeys.delete(expiredKey));
+    }
+    this.dedupKeys.set(key, nowMs + this.dedupWindowMs);
   }
 }
 

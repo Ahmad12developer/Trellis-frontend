@@ -89,6 +89,42 @@ describe('Webhook Verification', () => {
     expect(result2.code).toBe('DUPLICATE_EVENT');
   });
 
+  it('scopes duplicate IDs to the signing secret', () => {
+    const payload = JSON.stringify({ event: 'test' });
+    const timestamp = Date.now().toString();
+    const eventId = 'evt_shared';
+    const headersFor = (signingSecret: string) => {
+      const headers = new Headers();
+      headers.set('x-webhook-signature', crypto.createHmac('sha256', signingSecret).update(`${timestamp}.${payload}`).digest('hex'));
+      headers.set('x-webhook-timestamp', timestamp);
+      headers.set('x-webhook-event-id', eventId);
+      return headers;
+    };
+
+    expect(verifyWebhook(payload, headersFor(secret), { secret }).valid).toBe(true);
+    const otherSecret = 'another_test_secret';
+    expect(verifyWebhook(payload, headersFor(otherSecret), { secret: otherSecret }).valid).toBe(true);
+  });
+
+  it('expires duplicate IDs when the replay window ends', () => {
+    const payload = JSON.stringify({ event: 'test' });
+    let clock = 1_800_000_000_000;
+    const eventId = 'evt_expiring';
+    const send = () => {
+      const timestamp = clock.toString();
+      const headers = new Headers();
+      headers.set('x-webhook-signature', generateSignature(payload, timestamp));
+      headers.set('x-webhook-timestamp', timestamp);
+      headers.set('x-webhook-event-id', eventId);
+      return verifyWebhook(payload, headers, { secret, maxWindowMs: 1000, now: () => clock });
+    };
+
+    expect(send().valid).toBe(true);
+    expect(send().code).toBe('DUPLICATE_EVENT');
+    clock += 1001;
+    expect(send().valid).toBe(true);
+  });
+
   it('rejects malformed signature formats safely', () => {
     const payload = JSON.stringify({ event: 'test' });
     const timestamp = Date.now().toString();

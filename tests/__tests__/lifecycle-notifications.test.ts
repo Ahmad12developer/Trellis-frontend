@@ -36,6 +36,23 @@ describe('Lifecycle Notification System (Issue #40)', () => {
     expect(userNotifs.length).toBe(1);
   });
 
+  it('expires duplicate keys after the retention window', () => {
+    const event = {
+      dedupKey: 'scheduled-summary-2026-01-01',
+      type: 'simulation_completed' as const,
+      title: 'Simulation complete',
+      message: 'The simulation finished.',
+      severity: 'success' as const,
+    };
+    const firstTime = new Date('2026-01-01T00:00:00.000Z');
+
+    expect(lifecycleNotifications.dispatch(event, { now: firstTime }).isDuplicate).toBe(false);
+    expect(lifecycleNotifications.dispatch(event, { now: firstTime }).isDuplicate).toBe(true);
+    expect(lifecycleNotifications.dispatch(event, {
+      now: new Date(firstTime.getTime() + 24 * 60 * 60 * 1000 + 1),
+    }).isDuplicate).toBe(false);
+  });
+
   it('isolates recipient notifications and prevents data leakage across users', () => {
     const userA = 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5';
     const userB = 'GA2C5RFPE6GCKMY3US5PAB6UZLKIGAHWKXX2GIOVPXRKVKE544EOXY2S';
