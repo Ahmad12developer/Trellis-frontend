@@ -20,14 +20,65 @@ npx tsx scripts/reconcile-projections.ts --dry-run
 npx tsx scripts/reconcile-projections.ts --file path/to/snapshot.json --dry-run --json
 
 # 3. Apply repairs using a verified dry-run plan digest and archive a rollback snapshot
+TRELLIS_REPAIR_ACTOR_TOKEN=<signed-admin-actor-token> \
 npx tsx scripts/reconcile-projections.ts \
   --file path/to/snapshot.json \
   --apply \
   --plan-digest <planDigestFromDryRun> \
   --report .trellis/reconciliation-report.json \
   --rollback-out .trellis/reconciliation-rollback.json
+
+# 4. Start an authorized repair that can be resumed after interruption
+TRELLIS_REPAIR_ACTOR_TOKEN=<signed-admin-actor-token> \
+  npx tsx scripts/reconcile-projections.ts \
+  --file path/to/snapshot.json \
+  --apply \
+  --checkpoint .trellis/repair-job.json
+
+# 5. Resume the saved job with the same authoritative source snapshot
+TRELLIS_REPAIR_ACTOR_TOKEN=<fresh-signed-admin-actor-token> \
+  npx tsx scripts/reconcile-projections.ts \
+  --file path/to/snapshot.json \
+  --apply \
+  --resume .trellis/repair-job.json
 ```
 
+The CLI token is verified with `PERMISSION_TOKEN_SECRET`; only an `admin` granted
+the confirmed `repair_records` action may start or resume a repair. Keep the
+token out of command-line arguments and logs. Dry-runs remain unauthenticated and
+non-mutating. Library callers of `applyReconciliationRepair`,
+`reconcileAndRepair` with `apply: true`, and the resumable APIs must provide an
+`authorize` callback that resolves `true` only after their own trusted identity
+and permission checks.
+
+Checkpoint files contain the approved plan, the original rollback projection,
+and the latest projection state. Restrict filesystem access accordingly. The
+source snapshot remains the operator's responsibility and must be identical on
+resume.
+
+## Resumable Job Lifecycle
+
+`startResumableRepairJob` persists an approved plan and rollback snapshot before
+writing any projection. It commits one idempotent operation at a time and
+advances the durable operation index after each projection write.
+`resumeResumableRepairJob` re-authorizes the caller and checks the source
+fingerprint, checkpoint digest, and projection state before continuing.
+
+- If the process stops after a projection write but before its checkpoint is
+  advanced, resume accepts exactly that one in-flight operation and records it
+  as complete. It then continues without double-applying relative deltas.
+- An operation failure leaves a `failed` checkpoint with the completed index
+  and error message. Resolve the underlying store/I/O problem, then rerun
+  `--resume`; completed operations are not rerun.
+- A changed source, unexpected projection mutation, invalid checkpoint, or
+  missing authorization fails closed before additional writes. Do not edit a
+  checkpoint manually; run a new dry-run and start a new job instead.
+- A completed checkpoint can be resumed safely; it performs verification and
+  makes no additional repair writes.
+- The CLI's checkpoint-file rename is atomic on the same filesystem. The
+  projection adapter and checkpoint adapter supplied by library callers should
+  also use durable writes; when they cannot commit together, the one-operation
+  replay rule handles a crash between the projection write and checkpoint save.
 ---
 
 ## Dry-Run-First Repair Workflow
@@ -75,6 +126,13 @@ npx tsx scripts/reconcile-projections.ts \
   In-memory telemetry buffers cap at `MAX_IDEMPOTENCY_EVENTS` / `MAX_ABUSE_EVENTS` (500 events) while cumulative counters continue incrementing. The reconciler checks `maxBufferSize` to distinguish expected ring-buffer eviction from `DUPLICATE_EVENT_REPLAY`.
 - **Floating-Point Rounding in Rates and Currency Sums**:
   Currency totals are rounded to two decimal places and compared using a configurable `numericTolerance` (default `0.01`) to avoid false-positive drift alerts from IEEE-754 representation noise.
+- **Authorization expiry during recovery**:
+  Every start/resume request is authorized again. Supply a fresh signed admin
+  token after expiry; authorization failure does not advance the checkpoint.
+- **Checkpoint/source mismatch**:
+  Resume with the same source snapshot used to approve the plan. A deliberate
+  source update invalidates the checkpoint; preserve it for audit and create a
+  new dry-run/job rather than weakening fingerprint checks.
 
 ---
 
@@ -83,13 +141,39 @@ npx tsx scripts/reconcile-projections.ts \
 If an applied repair needs to be reverted:
 
 1. **Programmatic Rollback**:
-   Pass the `RollbackSnapshot` returned in `applyReport.rollbackSnapshot` (or saved via `--rollback-out`) to `rollbackReconciliationRepair(store, snapshot)`:
+   Pass the `RollbackSnapshot` returned in `applyReport.rollbackSnapshot` (or saved via `--rollback-out`) to `rollbackReconciliationRepair(store, snapshot, authorize)`:
    ```ts
    import { rollbackReconciliationRepair } from '@/lib/reconciliation';
 
-   await rollbackReconciliationRepair(projectionStore, applyReport.rollbackSnapshot);
+   await rollbackReconciliationRepair(
+     projectionStore,
+     applyReport.rollbackSnapshot,
+     authorizeRepair,
+   );
    ```
 2. **Verification After Rollback**:
    Re-run `runReconciliation(source, await projectionStore.readProjection())` and confirm that `repairPlan.projectionFingerprint` matches the pre-repair `projectionFingerprint` recorded in the original dry-run report.
 3. **Partial Repair Recovery**:
-   Because every `RepairOperation` (`upsert`, `delete`, `recompute`) is idempotent and overwrites with full authoritative values rather than relative deltas, interrupted runs can be safely resumed by generating a fresh dry-run plan and applying it.
+   For a checkpointed job, fix the store failure and resume the same job; the
+   operation index preserves progress. Without a checkpoint, or when its source
+   or projection fingerprint is stale, generate a fresh dry-run and apply the
+   new plan. `upsert`, `delete`, and `recompute` operations are idempotent full
+   state writes, not relative deltas.
+4. **Rollback of a Resumed Job**:
+   Use the `rollbackSnapshot` in the final report or the checkpoint's embedded
+   snapshot with `rollbackReconciliationRepair`. It restores the complete
+   projection as it existed before the first operation, including operations
+   completed before a process interruption. Verify by reconciling against that
+   snapshot's source; rollback itself should be run only after the same
+   authorization policy used for repair approves the operator.
+
+## Contract and Migration
+
+The source snapshot (`{ "source": ..., "projection": ... }`), dry-run report,
+repair plan digest, and rollback snapshot formats are unchanged. Existing
+non-mutating dry-runs require no changes. Mutating library calls now require an
+`authorize` callback; migrate callers to delegate it to their trusted
+authentication/permission layer. The CLI migration is to provide a signed admin
+actor token through `TRELLIS_REPAIR_ACTOR_TOKEN`. Existing `--apply` behavior
+without checkpointing remains available, while `--checkpoint` and `--resume`
+opt into durable progress.

@@ -182,6 +182,28 @@ export interface ProjectionStoreAdapter {
   writeProjection(nextState: ReconciliationProjectionState): Promise<void> | void;
 }
 
+export interface RepairJobCheckpoint {
+  version: 1;
+  jobId: string;
+  domains: readonly ProjectionDomain[];
+  plan: RepairPlan;
+  sourceFingerprint: string;
+  operationsToApply: readonly RepairOperation[];
+  nextOperationIndex: number;
+  projectionState: ReconciliationProjectionState;
+  rollbackSnapshot: RollbackSnapshot;
+  status: 'running' | 'failed' | 'completed';
+  errors: readonly string[];
+  updatedAt: string;
+}
+
+export interface RepairJobCheckpointStore {
+  readCheckpoint(jobId: string): Promise<RepairJobCheckpoint | null> | RepairJobCheckpoint | null;
+  writeCheckpoint(checkpoint: RepairJobCheckpoint): Promise<void> | void;
+}
+
+export type RepairAuthorization = () => boolean | Promise<boolean>;
+
 export interface ReconciliationSummary {
   domainsEvaluated: readonly ProjectionDomain[];
   recordsCompared: number;
@@ -236,6 +258,8 @@ export interface RunReconciliationOptions {
 }
 
 export interface ApplyReconciliationRepairOptions extends RunReconciliationOptions {
+  /** Must resolve true only after the caller's authorization policy allows a repair. */
+  authorize?: RepairAuthorization;
   /**
    * Dry-run-first guard: requires a `RepairPlan` or `planDigest` produced by a
    * prior `runReconciliation` dry-run against the exact same source and projection state.

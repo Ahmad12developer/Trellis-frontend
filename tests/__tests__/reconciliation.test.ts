@@ -5,8 +5,11 @@ import {
   reconcileAndRepair,
   renderReconciliationTextReport,
   rollbackReconciliationRepair,
+  resumeResumableRepairJob,
   runReconciliation,
+  startResumableRepairJob,
   type ReconciliationProjectionState,
+  type RepairJobCheckpoint,
   type ReconciliationSourceState,
   type RollbackSnapshot,
 } from '@/lib/reconciliation';
@@ -412,10 +415,11 @@ describe('Projection Reconciliation Job', () => {
     expect(dryRunReport.findings.length).toBeGreaterThanOrEqual(4);
 
     const store = createMemoryProjectionStore(projection);
+    const authorize = () => true;
 
     // 2. Calling applyReconciliationRepair without approvedPlan fails closed
     await expect(
-      applyReconciliationRepair(source, store, { requireDryRunApproval: true }),
+      applyReconciliationRepair(source, store, { requireDryRunApproval: true, authorize }),
     ).rejects.toMatchObject({
       code: 'DRY_RUN_REQUIRED',
     });
@@ -427,6 +431,7 @@ describe('Projection Reconciliation Job', () => {
     await expect(
       applyReconciliationRepair(mutatedSource, store, {
         approvedPlan: dryRunReport.repairPlan,
+        authorize,
       }),
     ).rejects.toBeInstanceOf(ReconciliationRepairError);
 
@@ -436,6 +441,7 @@ describe('Projection Reconciliation Job', () => {
     // 4. Applying with the valid dry-run plan repairs all drift and verifies clean post-state
     const applyReport = await applyReconciliationRepair(source, store, {
       approvedPlan: dryRunReport.repairPlan,
+      authorize,
     });
 
     expect(applyReport.mode).toBe('apply');
@@ -453,7 +459,14 @@ describe('Projection Reconciliation Job', () => {
     expect(repairedState.telemetry?.idempotencyCounters?.idempotency_hits).toBe(1);
 
     // 5. Rolling back restores the exact pre-repair corrupted projection state
-    await rollbackReconciliationRepair(store, applyReport.rollbackSnapshot as RollbackSnapshot);
+    await expect(
+      rollbackReconciliationRepair(store, applyReport.rollbackSnapshot as RollbackSnapshot),
+    ).rejects.toMatchObject({ code: 'REPAIR_UNAUTHORIZED' });
+    await rollbackReconciliationRepair(
+      store,
+      applyReport.rollbackSnapshot as RollbackSnapshot,
+      authorize,
+    );
     expect(JSON.stringify(store.getState())).toBe(snapshotBeforeDryRun);
   });
 
@@ -465,6 +478,7 @@ describe('Projection Reconciliation Job', () => {
     const { dryRunReport, applyReport } = await reconcileAndRepair(source, store, {
       apply: true,
       domains: ['search-index'],
+      authorize: () => true,
     });
 
     expect(dryRunReport.status).toBe('drift_detected');
@@ -487,5 +501,63 @@ describe('Projection Reconciliation Job', () => {
 
     const exitCode = await runCli(['--dry-run', '--json']);
     expect(exitCode).toBe(0);
+  });
+
+  it('fails closed on unauthorized repair and resumes a failed job from its checkpoint', async () => {
+    const { source, projection } = buildHealthyFixture();
+    projection.affiliate!.earningsLedger = [];
+    projection.searchIndex!.indexedRecords = [];
+
+    const dryRun = runReconciliation(source, projection, {
+      domains: ['affiliate-ledger', 'search-index'],
+    });
+    let state = projection;
+    let writes = 0;
+    const store = {
+      readProjection: () => JSON.parse(JSON.stringify(state)) as ReconciliationProjectionState,
+      writeProjection: (next: ReconciliationProjectionState) => {
+        writes += 1;
+        if (writes === 2) throw new Error('injected projection write failure');
+        state = JSON.parse(JSON.stringify(next)) as ReconciliationProjectionState;
+      },
+    };
+    const savedCheckpoint: { value?: RepairJobCheckpoint } = {};
+    const checkpointStore = {
+      readCheckpoint: (jobId: string) =>
+        savedCheckpoint.value?.jobId === jobId ? savedCheckpoint.value : null,
+      writeCheckpoint: (next: RepairJobCheckpoint) => {
+        savedCheckpoint.value = JSON.parse(JSON.stringify(next)) as RepairJobCheckpoint;
+      },
+    };
+
+    await expect(
+      startResumableRepairJob(source, store, checkpointStore, {
+        jobId: 'unauthorized-repair',
+        approvedPlan: dryRun.repairPlan,
+        authorize: () => false,
+      }),
+    ).rejects.toMatchObject({ code: 'REPAIR_UNAUTHORIZED' });
+    expect(writes).toBe(0);
+    expect(savedCheckpoint.value).toBeUndefined();
+
+    const failed = await startResumableRepairJob(source, store, checkpointStore, {
+      jobId: 'repair-retry',
+      approvedPlan: dryRun.repairPlan,
+      authorize: () => true,
+    });
+    expect(failed.status).toBe('failed');
+    expect(failed.summary.repairedCount).toBe(1);
+    expect(savedCheckpoint.value?.status).toBe('failed');
+    expect(savedCheckpoint.value?.nextOperationIndex).toBe(1);
+
+    const healthyStore = createMemoryProjectionStore(state);
+    const resumed = await resumeResumableRepairJob(source, healthyStore, checkpointStore, {
+      jobId: 'repair-retry',
+      authorize: () => true,
+    });
+    expect(resumed.status).toBe('repaired');
+    expect(resumed.postRepairVerification?.verifiedClean).toBe(true);
+    expect(savedCheckpoint.value?.status).toBe('completed');
+    expect(healthyStore.getState().searchIndex?.indexedRecords).toHaveLength(1);
   });
 });

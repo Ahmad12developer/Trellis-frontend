@@ -32,6 +32,16 @@ export interface ConflictResolutionStore {
     value: JsonObject,
     writer: EditIdentity,
   ): Promise<boolean>;
+  /**
+   * Optional. Version at which `identity` was committed, or `null` if never.
+   *
+   * Without it, a retried edit is recognised only while it is still the latest
+   * writer. Once another client commits on top, a retry whose response was lost
+   * merges again from its original base and can resurrect a value that a later
+   * edit deliberately replaced. Stores that keep an applied-operation log should
+   * implement this so such retries report `already_applied` instead.
+   */
+  findAppliedVersion?(resourceId: string, identity: EditIdentity): Promise<number | null>;
 }
 
 export interface ConflictResolverOptions {
@@ -238,6 +248,18 @@ export async function resolveEdit(
 
     if (sameIdentity(current.lastWriter, proposal.identity)) {
       return { status: "already_applied", version: current.version };
+    }
+
+    if (store.findAppliedVersion) {
+      let appliedVersion: number | null;
+      try {
+        appliedVersion = await store.findAppliedVersion(proposal.resourceId, proposal.identity);
+      } catch (cause) {
+        return { status: "storage_error", phase: "read", cause };
+      }
+      if (appliedVersion !== null) {
+        return { status: "already_applied", version: appliedVersion };
+      }
     }
 
     if (

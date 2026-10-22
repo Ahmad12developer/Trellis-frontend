@@ -5,6 +5,7 @@ import {
   ROLES,
   can,
   canEscalateRole,
+  buildPermissionDiff,
   checkPermission,
   getAllowedActions,
   getPermissionEntry,
@@ -143,6 +144,24 @@ describe('denied access', () => {
         expect(decision.code).toBe('denied_by_policy');
       }
     }
+  });
+
+  it('allows only an explicitly confirmed admin to repair records', () => {
+    for (const role of ROLES) {
+      const decision = checkPermission('repair_records', {
+        role,
+        resourceScope: 'global',
+        context: { confirmed: true },
+      });
+      expect(decision.allowed).toBe(role === 'admin');
+    }
+    expect(
+      checkPermission('repair_records', {
+        role: 'admin',
+        resourceScope: 'global',
+        context: { confirmed: false },
+      }).allowed,
+    ).toBe(false);
   });
 
   it('denies an admin a retention cleanup that was not explicitly confirmed', () => {
@@ -323,6 +342,14 @@ describe('introspection', () => {
     expect(actions).not.toContain('impersonate_user');
     // Admin-only, so it must not appear for a maintainer at any scope.
     expect(getAllowedActions('maintainer', 'global')).not.toContain('run_retention_cleanup');
+  });
+
+  it('reports grants and revocations before a role change', () => {
+    const changes = buildPermissionDiff('viewer', 'maintainer', 'project');
+    expect(changes.some(({ action, change }) => action === 'import_data' && change === 'granted')).toBe(true);
+    expect(changes.some(({ action, change }) => action === 'view_audit_logs' && change === 'granted')).toBe(true);
+    expect(changes.every(({ before, after }) => before.role === 'viewer' && after.role === 'maintainer')).toBe(true);
+    expect(buildPermissionDiff('admin', 'admin')).toEqual([]);
   });
 
   it('keeps the legacy role vocabularies mappable', () => {

@@ -14,6 +14,9 @@ export async function GET(request: NextRequest) {
 export async function POST(request: NextRequest) {
   try {
     const text = await request.text();
+    // Parse before marking an event ID as seen. A malformed payload must be
+    // correctable and retryable without poisoning the duplicate registry.
+    const body = JSON.parse(text);
     
     // In a real environment, you'd want this required, but for tests/dev without it, 
     // we should perhaps only enforce if a secret is configured, or require it explicitly.
@@ -28,7 +31,6 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const body = JSON.parse(text);
     const result = lifecycleNotifications.dispatch(body);
     return NextResponse.json(result, { status: result.isDuplicate ? 200 : 201 });
   } catch (err: any) {

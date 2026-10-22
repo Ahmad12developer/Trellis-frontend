@@ -12,18 +12,32 @@
  *   npx tsx scripts/reconcile-projections.ts --file path/to/snapshot.json --apply --report .trellis/recon-report.json
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { verifyActorToken } from '../lib/auth/actor';
+import { checkPermission } from '../lib/permissions';
 import {
   PROJECTION_DOMAINS,
   applyReconciliationRepair,
   createMemoryProjectionStore,
   reconcileAndRepair,
   renderReconciliationTextReport,
+  resumeResumableRepairJob,
   runReconciliation,
+  startResumableRepairJob,
   type ProjectionDomain,
+  type RepairJobCheckpoint,
+  type RepairJobCheckpointStore,
   type ReconciliationProjectionState,
+  type ReconciliationReport,
   type ReconciliationSourceState,
 } from '../lib/reconciliation';
 
@@ -41,6 +55,8 @@ export interface CliOptions {
   json: boolean;
   reportPath: string | null;
   rollbackPath: string | null;
+  checkpointPath: string | null;
+  resumePath: string | null;
   help: boolean;
 }
 
@@ -55,6 +71,8 @@ export function parseReconcileArgs(argv: readonly string[]): CliOptions {
     json: false,
     reportPath: null,
     rollbackPath: null,
+    checkpointPath: null,
+    resumePath: null,
     help: false,
   };
 
@@ -121,9 +139,33 @@ export function parseReconcileArgs(argv: readonly string[]): CliOptions {
         i += 1;
         break;
       }
+      case '--checkpoint': {
+        const val = argv[i + 1];
+        if (!val) throw new Error('--checkpoint requires a checkpoint output path');
+        opts.checkpointPath = val;
+        i += 1;
+        break;
+      }
+      case '--resume': {
+        const val = argv[i + 1];
+        if (!val) throw new Error('--resume requires an existing checkpoint path');
+        opts.resumePath = val;
+        i += 1;
+        break;
+      }
       default:
         throw new Error(`Unknown option: ${arg}`);
     }
+  }
+
+  if (opts.checkpointPath && opts.resumePath) {
+    throw new Error('--checkpoint and --resume cannot be used together');
+  }
+  if ((opts.checkpointPath || opts.resumePath) && !opts.apply) {
+    throw new Error('--checkpoint and --resume require --apply');
+  }
+  if (opts.resumePath && opts.planDigest) {
+    throw new Error('--plan-digest cannot be used when resuming an approved job');
   }
 
   return opts;
@@ -269,6 +311,70 @@ function loadSnapshotFile(filePath: string): {
   throw new Error('Snapshot JSON must contain { "source": {...}, "projection": {...} }');
 }
 
+function createFileCheckpointStore(filePath: string): RepairJobCheckpointStore {
+  const abs = resolve(filePath);
+  return {
+    readCheckpoint(jobId) {
+      if (!existsSync(abs)) return null;
+      const parsed = JSON.parse(readFileSync(abs, 'utf-8')) as RepairJobCheckpoint;
+      if (!parsed || typeof parsed !== 'object' || parsed.version !== 1) {
+        throw new Error(`Repair checkpoint is invalid: ${abs}`);
+      }
+      if (parsed.jobId !== jobId) {
+        throw new Error(`Repair checkpoint belongs to a different job: ${abs}`);
+      }
+      return parsed;
+    },
+    writeCheckpoint(checkpoint) {
+      mkdirSync(dirname(abs), { recursive: true });
+      const temporaryPath = `${abs}.${process.pid}.tmp`;
+      try {
+        writeFileSync(temporaryPath, JSON.stringify(checkpoint, null, 2), 'utf-8');
+        renameSync(temporaryPath, abs);
+      } catch (error) {
+        if (existsSync(temporaryPath)) unlinkSync(temporaryPath);
+        throw error;
+      }
+    },
+  };
+}
+
+function loadFileCheckpoint(filePath: string): RepairJobCheckpoint {
+  const abs = resolve(filePath);
+  if (!existsSync(abs)) {
+    throw new Error(`Repair checkpoint not found: ${abs}`);
+  }
+  const parsed = JSON.parse(readFileSync(abs, 'utf-8')) as RepairJobCheckpoint;
+  if (
+    !parsed ||
+    typeof parsed !== 'object' ||
+    parsed.version !== 1 ||
+    typeof parsed.jobId !== 'string' ||
+    !parsed.projectionState
+  ) {
+    throw new Error(`Repair checkpoint is invalid: ${abs}`);
+  }
+  return parsed;
+}
+
+async function authorizeRepair(): Promise<boolean> {
+  const token = process.env.TRELLIS_REPAIR_ACTOR_TOKEN ?? null;
+  const resolution = await verifyActorToken(token);
+  if (!resolution.ok) {
+    throw new Error(`Repair authorization denied: ${resolution.failure}`);
+  }
+  const decision = checkPermission('repair_records', {
+    role: resolution.actor.role,
+    actorId: resolution.actor.id,
+    resourceScope: 'global',
+    context: { confirmed: true },
+  });
+  if (!decision.allowed) {
+    throw new Error(`Repair authorization denied: ${decision.code ?? decision.reason}`);
+  }
+  return true;
+}
+
 function printHelp(): void {
   console.log(`
 Trellis Projection Reconciliation Job
@@ -285,8 +391,13 @@ Options:
       --only <findingId>    Repair only specific finding ID(s) (repeatable)
       --report <path>       Write full ReconciliationReport JSON to file
       --rollback-out <path> Write pre-repair RollbackSnapshot JSON to file
+      --checkpoint <path>   Persist an authorized repair job for later resumption
+      --resume <path>       Resume a saved job; requires the same source snapshot
       --json                Print report as JSON to stdout
   -h, --help                Show this help message
+
+Applying repairs requires a valid admin actor token in TRELLIS_REPAIR_ACTOR_TOKEN
+(signed with PERMISSION_TOKEN_SECRET). Dry-runs do not require authorization.
 `);
 }
 
@@ -305,8 +416,13 @@ export async function runCli(argv: readonly string[] = process.argv.slice(2)): P
   }
 
   let snapshot: { source: ReconciliationSourceState; projection: ReconciliationProjectionState };
+  let savedCheckpoint: RepairJobCheckpoint | null = null;
   try {
     snapshot = opts.file ? loadSnapshotFile(opts.file) : buildDefaultSnapshot();
+    if (opts.resumePath) {
+      savedCheckpoint = loadFileCheckpoint(opts.resumePath);
+      snapshot.projection = savedCheckpoint.projectionState;
+    }
   } catch (err) {
     console.error(err instanceof Error ? err.message : String(err));
     return EXIT_USAGE;
@@ -317,23 +433,55 @@ export async function runCli(argv: readonly string[] = process.argv.slice(2)): P
   const onlyFindingIds = opts.onlyFindingIds.length > 0 ? opts.onlyFindingIds : undefined;
 
   try {
-    const report = opts.apply
-      ? opts.planDigest
-        ? await applyReconciliationRepair(snapshot.source, store, {
+    let report: ReconciliationReport;
+    if (opts.resumePath && savedCheckpoint) {
+      report = await resumeResumableRepairJob(
+        snapshot.source,
+        store,
+        createFileCheckpointStore(opts.resumePath),
+        {
+          jobId: savedCheckpoint.jobId,
+          domains,
+          onlyFindingIds,
+          authorize: authorizeRepair,
+        },
+      );
+    } else if (opts.checkpointPath) {
+      const dryRun = runReconciliation(snapshot.source, snapshot.projection, { domains });
+      report = await startResumableRepairJob(
+        snapshot.source,
+        store,
+        createFileCheckpointStore(opts.checkpointPath),
+        {
+          jobId: dryRun.jobId,
+          domains,
+          onlyFindingIds,
+          approvedPlan: opts.planDigest ?? dryRun.repairPlan,
+          requireDryRunApproval: true,
+          authorize: authorizeRepair,
+        },
+      );
+    } else {
+      report = opts.apply
+        ? opts.planDigest
+          ? await applyReconciliationRepair(snapshot.source, store, {
             domains,
             onlyFindingIds,
             approvedPlan: opts.planDigest,
             requireDryRunApproval: true,
+            authorize: authorizeRepair,
           })
-        : (
-            await reconcileAndRepair(snapshot.source, store, {
+          : (
+              await reconcileAndRepair(snapshot.source, store, {
               domains,
               onlyFindingIds,
               apply: true,
+              authorize: authorizeRepair,
             })
-          ).applyReport ??
-          runReconciliation(snapshot.source, snapshot.projection, { domains })
-      : runReconciliation(snapshot.source, snapshot.projection, { domains });
+            ).applyReport ??
+            runReconciliation(snapshot.source, snapshot.projection, { domains })
+        : runReconciliation(snapshot.source, snapshot.projection, { domains });
+    }
 
     if (opts.reportPath) {
       const absReport = resolve(opts.reportPath);

@@ -28,6 +28,12 @@ callback; the server/store remains authoritative.
   operation identity for a distinct edit. Store and authorization exceptions
   are returned with their phase/cause and are not treated as successful
   writes.
+- Stores may implement the optional `findAppliedVersion(resourceId,
+  identity)`. When present, an operation committed earlier is reported as
+  `already_applied` even after another client has written on top of it.
+  Without it, such a retry merges again from its original base and can revert
+  the newer edit. See
+  [concurrent-write-replay.md](./concurrent-write-replay.md#lost-response--intervening-write-can-resurrect-stale-data).
 - Inputs must be JSON-compatible object documents. Proposals based on future
   versions or inconsistent base snapshots are rejected.
 

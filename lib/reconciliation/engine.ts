@@ -22,6 +22,9 @@ import {
   type DriftSeverity,
   type ProjectionDomain,
   type ProjectionStoreAdapter,
+  type RepairAuthorization,
+  type RepairJobCheckpoint,
+  type RepairJobCheckpointStore,
   type ReconciliationJobStatus,
   type ReconciliationProjectionState,
   type ReconciliationReport,
@@ -35,9 +38,14 @@ import {
 
 export type ReconciliationErrorCode =
   | 'DRY_RUN_REQUIRED'
+  | 'REPAIR_UNAUTHORIZED'
   | 'PLAN_STALE_STATE_CHANGED'
   | 'UNKNOWN_DOMAIN'
-  | 'ROLLBACK_INVALID_SNAPSHOT';
+  | 'ROLLBACK_INVALID_SNAPSHOT'
+  | 'JOB_ALREADY_EXISTS'
+  | 'JOB_NOT_FOUND'
+  | 'JOB_CHECKPOINT_INVALID'
+  | 'JOB_STALE_STATE_CHANGED';
 
 export class ReconciliationRepairError extends Error {
   readonly code: ReconciliationErrorCode;
@@ -157,6 +165,15 @@ function buildSummary(
     byDomain[finding.domain] += 1;
     if (finding.repairable) repairableCount += 1;
     else manualReviewCount += 1;
+  }
+
+  async function requireRepairAuthorization(authorize?: RepairAuthorization): Promise<void> {
+    if (!authorize || !(await authorize())) {
+      throw new ReconciliationRepairError(
+        'REPAIR_UNAUTHORIZED',
+        'Repair authorization was not granted. No projection changes were made.',
+      );
+    }
   }
 
   return {
@@ -280,6 +297,7 @@ export async function applyReconciliationRepair(
   store: ProjectionStoreAdapter,
   options: ApplyReconciliationRepairOptions = {},
 ): Promise<ReconciliationReport> {
+  await requireRepairAuthorization(options.authorize);
   const requireApproval = options.requireDryRunApproval !== false;
   if (requireApproval && !options.approvedPlan) {
     throw new ReconciliationRepairError(
@@ -346,7 +364,10 @@ export async function applyReconciliationRepair(
   }
 
   const postProjection = await store.readProjection();
-  const postRun = runReconciliation(source, postProjection, options);
+  const postRun = runReconciliation(source, postProjection, {
+    ...options,
+    domains: currentDryRun.summary.domainsEvaluated,
+  });
   const remainingRepairable = postRun.findings.filter((f) => f.repairable).length;
   const verifiedClean =
     failedCount === 0 &&
@@ -401,7 +422,11 @@ export async function applyReconciliationRepair(
 export async function reconcileAndRepair(
   source: ReconciliationSourceState,
   store: ProjectionStoreAdapter,
-  options: RunReconciliationOptions & { apply?: boolean; onlyFindingIds?: readonly string[] } = {},
+  options: RunReconciliationOptions & {
+    apply?: boolean;
+    onlyFindingIds?: readonly string[];
+    authorize?: RepairAuthorization;
+  } = {},
 ): Promise<{ dryRunReport: ReconciliationReport; applyReport?: ReconciliationReport }> {
   const initialProjection = await store.readProjection();
   const dryRunReport = runReconciliation(source, initialProjection, options);
@@ -419,6 +444,311 @@ export async function reconcileAndRepair(
   return { dryRunReport, applyReport };
 }
 
+  function checkpointProjectionAt(
+    checkpoint: RepairJobCheckpoint,
+    operationCount: number,
+  ): ReconciliationProjectionState {
+    const expected = cloneState(checkpoint.rollbackSnapshot.projectionBefore);
+    for (const operation of checkpoint.operationsToApply.slice(0, operationCount)) {
+      applyOperationToProjection(expected, operation);
+    }
+    return expected;
+  }
+
+  function isValidCheckpoint(checkpoint: RepairJobCheckpoint, jobId: string): boolean {
+    if (
+      !checkpoint ||
+      typeof checkpoint !== 'object' ||
+      !checkpoint.plan ||
+      !Array.isArray(checkpoint.plan.operations) ||
+      !Array.isArray(checkpoint.operationsToApply) ||
+      !Array.isArray(checkpoint.domains) ||
+      !Array.isArray(checkpoint.errors) ||
+      !checkpoint.rollbackSnapshot ||
+      !checkpoint.rollbackSnapshot.projectionBefore ||
+      !checkpoint.projectionState ||
+      !['running', 'failed', 'completed'].includes(checkpoint.status)
+    ) {
+      return false;
+    }
+    return (
+      checkpoint.version === 1 &&
+      checkpoint.jobId === jobId &&
+      checkpoint.domains.length > 0 &&
+      checkpoint.domains.every((domain) => PROJECTION_DOMAINS.includes(domain)) &&
+      checkpoint.plan.planDigest ===
+        computePlanDigest(
+          checkpoint.plan.sourceFingerprint,
+          checkpoint.plan.projectionFingerprint,
+          checkpoint.plan.operations,
+        ) &&
+      checkpoint.sourceFingerprint === checkpoint.plan.sourceFingerprint &&
+      computeStateFingerprint(checkpoint.rollbackSnapshot.projectionBefore) ===
+        checkpoint.plan.projectionFingerprint &&
+      canonicalJson(checkpoint.operationsToApply) ===
+        canonicalJson(
+          checkpoint.plan.operations.filter((operation) =>
+            checkpoint.operationsToApply.some((selected) => selected.findingId === operation.findingId),
+          ),
+        ) &&
+      Number.isInteger(checkpoint.nextOperationIndex) &&
+      checkpoint.nextOperationIndex >= 0 &&
+      checkpoint.nextOperationIndex <= checkpoint.operationsToApply.length &&
+      checkpoint.rollbackSnapshot.planDigest === checkpoint.plan.planDigest
+    );
+  }
+
+  function buildResumableReport(
+    source: ReconciliationSourceState,
+    projection: ReconciliationProjectionState,
+    checkpoint: RepairJobCheckpoint,
+    options: RunReconciliationOptions,
+    failedCount: number,
+  ): ReconciliationReport {
+    const reportOptions = { ...options, domains: checkpoint.domains };
+    const postRun = runReconciliation(source, projection, reportOptions);
+    const initialRun = runReconciliation(
+      source,
+      checkpoint.rollbackSnapshot.projectionBefore,
+      reportOptions,
+    );
+    const remainingRepairable = postRun.findings.filter((finding) => finding.repairable).length;
+    const wasFiltered = checkpoint.operationsToApply.length !== checkpoint.plan.operations.length;
+    const verifiedClean =
+      failedCount === 0 &&
+      (wasFiltered
+        ? postRun.findings.filter((finding) =>
+            checkpoint.operationsToApply.some((operation) => operation.findingId === finding.id),
+          ).length === 0
+        : remainingRepairable === 0);
+    const status: ReconciliationJobStatus =
+      failedCount > 0
+        ? 'failed'
+        : postRun.findings.length === 0
+          ? checkpoint.plan.operations.length === 0
+            ? 'clean'
+            : 'repaired'
+          : 'partially_repaired';
+    const summary = buildSummary(
+      initialRun.summary.domainsEvaluated,
+      initialRun.summary.recordsCompared,
+      initialRun.findings,
+      checkpoint.nextOperationIndex,
+      checkpoint.plan.operations.length - checkpoint.operationsToApply.length +
+        (checkpoint.plan.manualReviewFindings.length),
+      failedCount,
+    );
+
+    return {
+      jobId: checkpoint.jobId,
+      timestamp: options.nowIso ?? new Date().toISOString(),
+      mode: 'apply',
+      ok: failedCount === 0 && postRun.findings.length === 0,
+      status,
+      summary,
+      findings: initialRun.findings,
+      repairPlan: checkpoint.plan,
+      rollbackSnapshot: checkpoint.rollbackSnapshot,
+      postRepairVerification: {
+        verifiedClean,
+        remainingDriftCount: postRun.findings.length,
+        remainingRepairableCount: remainingRepairable,
+        remainingFindings: postRun.findings,
+      },
+      errors: checkpoint.errors,
+    };
+  }
+
+  async function executeResumableRepairJob(
+    source: ReconciliationSourceState,
+    store: ProjectionStoreAdapter,
+    checkpointStore: RepairJobCheckpointStore,
+    checkpoint: RepairJobCheckpoint,
+    options: ApplyReconciliationRepairOptions,
+  ): Promise<ReconciliationReport> {
+    const currentSourceFingerprint = computeStateFingerprint(source);
+    if (currentSourceFingerprint !== checkpoint.sourceFingerprint) {
+      throw new ReconciliationRepairError(
+        'JOB_STALE_STATE_CHANGED',
+        'The authoritative source changed since this repair job was approved. Create a fresh dry-run before retrying.',
+      );
+    }
+    const approvedPlan = runReconciliation(
+      source,
+      checkpoint.rollbackSnapshot.projectionBefore,
+      { domains: checkpoint.domains },
+    );
+    if (approvedPlan.repairPlan.planDigest !== checkpoint.plan.planDigest) {
+      throw new ReconciliationRepairError(
+        'JOB_CHECKPOINT_INVALID',
+        'The saved repair plan does not match the source and original projection recorded in its checkpoint.',
+      );
+    }
+
+    let currentProjection = await store.readProjection();
+    let expectedProjection = checkpointProjectionAt(checkpoint, checkpoint.nextOperationIndex);
+    if (computeStateFingerprint(currentProjection) !== computeStateFingerprint(expectedProjection)) {
+      const operationAfterCheckpoint =
+        checkpoint.operationsToApply[checkpoint.nextOperationIndex];
+      if (!operationAfterCheckpoint) {
+        throw new ReconciliationRepairError(
+          'JOB_STALE_STATE_CHANGED',
+          'Projection state no longer matches the completed repair checkpoint.',
+        );
+      }
+      expectedProjection = checkpointProjectionAt(checkpoint, checkpoint.nextOperationIndex + 1);
+      if (computeStateFingerprint(currentProjection) !== computeStateFingerprint(expectedProjection)) {
+        throw new ReconciliationRepairError(
+          'JOB_STALE_STATE_CHANGED',
+          'Projection state no longer matches this repair job or its last in-flight operation.',
+        );
+      }
+      checkpoint.nextOperationIndex += 1;
+      checkpoint.projectionState = cloneState(currentProjection);
+      checkpoint.status = 'running';
+      checkpoint.errors = [];
+      checkpoint.updatedAt = options.nowIso ?? new Date().toISOString();
+      await checkpointStore.writeCheckpoint(checkpoint);
+    }
+
+    checkpoint.status = 'running';
+    checkpoint.errors = [];
+    checkpoint.updatedAt = options.nowIso ?? new Date().toISOString();
+    await checkpointStore.writeCheckpoint(checkpoint);
+
+    let failedCount = 0;
+    for (let index = checkpoint.nextOperationIndex; index < checkpoint.operationsToApply.length; index += 1) {
+      try {
+        currentProjection = cloneState(await store.readProjection());
+        if (
+          computeStateFingerprint(currentProjection) !==
+          computeStateFingerprint(checkpoint.projectionState)
+        ) {
+          throw new ReconciliationRepairError(
+            'JOB_STALE_STATE_CHANGED',
+            'Projection state changed while the repair job was running; no further operations were applied.',
+          );
+        }
+        applyOperationToProjection(currentProjection, checkpoint.operationsToApply[index]);
+        await store.writeProjection(currentProjection);
+        checkpoint.nextOperationIndex = index + 1;
+        checkpoint.projectionState = cloneState(currentProjection);
+        checkpoint.updatedAt = options.nowIso ?? new Date().toISOString();
+        await checkpointStore.writeCheckpoint(checkpoint);
+      } catch (error) {
+        failedCount = 1;
+        const message = `Repair operation ${checkpoint.operationsToApply[index].findingId} failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`;
+        checkpoint.status = 'failed';
+        checkpoint.errors = [...checkpoint.errors, message];
+        checkpoint.projectionState = cloneState(await store.readProjection());
+        checkpoint.updatedAt = options.nowIso ?? new Date().toISOString();
+        await checkpointStore.writeCheckpoint(checkpoint);
+        break;
+      }
+    }
+
+    currentProjection = await store.readProjection();
+    if (failedCount === 0) {
+      checkpoint.status = 'completed';
+      checkpoint.projectionState = cloneState(currentProjection);
+      checkpoint.updatedAt = options.nowIso ?? new Date().toISOString();
+      await checkpointStore.writeCheckpoint(checkpoint);
+    }
+    return buildResumableReport(source, currentProjection, checkpoint, options, failedCount);
+  }
+
+  /** Creates and executes an authorized, digest-approved repair job with durable progress checkpoints. */
+  export async function startResumableRepairJob(
+    source: ReconciliationSourceState,
+    store: ProjectionStoreAdapter,
+    checkpointStore: RepairJobCheckpointStore,
+    options: ApplyReconciliationRepairOptions & { jobId: string },
+  ): Promise<ReconciliationReport> {
+    await requireRepairAuthorization(options.authorize);
+    if (await checkpointStore.readCheckpoint(options.jobId)) {
+      throw new ReconciliationRepairError(
+        'JOB_ALREADY_EXISTS',
+        `Repair job '${options.jobId}' already exists. Resume it instead of replacing its checkpoint.`,
+      );
+    }
+    const projection = await store.readProjection();
+    const dryRun = runReconciliation(source, projection, options);
+    const requireApproval = options.requireDryRunApproval !== false;
+    if (requireApproval && !options.approvedPlan) {
+      throw new ReconciliationRepairError(
+        'DRY_RUN_REQUIRED',
+        'Refusing to start a repair job without a prior dry-run approval.',
+      );
+    }
+    if (options.approvedPlan) {
+      const approvedDigest =
+        typeof options.approvedPlan === 'string'
+          ? options.approvedPlan
+          : options.approvedPlan.planDigest;
+      if (approvedDigest !== dryRun.repairPlan.planDigest) {
+        throw new ReconciliationRepairError(
+          'PLAN_STALE_STATE_CHANGED',
+          'The approved dry-run digest does not match the current source and projection state.',
+        );
+      }
+    }
+    const selectedFindings = options.onlyFindingIds
+      ? new Set(options.onlyFindingIds)
+      : null;
+    const operationsToApply = dryRun.repairPlan.operations.filter(
+      (operation) => !selectedFindings || selectedFindings.has(operation.findingId),
+    );
+    const timestamp = options.nowIso ?? new Date().toISOString();
+    const checkpoint: RepairJobCheckpoint = {
+      version: 1,
+      jobId: options.jobId,
+      domains: dryRun.summary.domainsEvaluated,
+      plan: dryRun.repairPlan,
+      sourceFingerprint: dryRun.repairPlan.sourceFingerprint,
+      operationsToApply,
+      nextOperationIndex: 0,
+      projectionState: cloneState(projection),
+      rollbackSnapshot: {
+        snapshotId: `rb-${dryRun.repairPlan.planDigest.slice(0, 12)}`,
+        planId: dryRun.repairPlan.planId,
+        planDigest: dryRun.repairPlan.planDigest,
+        capturedAt: timestamp,
+        projectionBefore: cloneState(projection),
+      },
+      status: 'running',
+      errors: [],
+      updatedAt: timestamp,
+    };
+    await checkpointStore.writeCheckpoint(checkpoint);
+    return executeResumableRepairJob(source, store, checkpointStore, checkpoint, options);
+  }
+
+  /** Resumes an interrupted or failed repair job after re-authorizing and validating its checkpoint. */
+  export async function resumeResumableRepairJob(
+    source: ReconciliationSourceState,
+    store: ProjectionStoreAdapter,
+    checkpointStore: RepairJobCheckpointStore,
+    options: ApplyReconciliationRepairOptions & { jobId: string },
+  ): Promise<ReconciliationReport> {
+    await requireRepairAuthorization(options.authorize);
+    const checkpoint = await checkpointStore.readCheckpoint(options.jobId);
+    if (!checkpoint) {
+      throw new ReconciliationRepairError(
+        'JOB_NOT_FOUND',
+        `No repair checkpoint exists for job '${options.jobId}'.`,
+      );
+    }
+    if (!isValidCheckpoint(checkpoint, options.jobId)) {
+      throw new ReconciliationRepairError(
+        'JOB_CHECKPOINT_INVALID',
+        `Repair checkpoint for job '${options.jobId}' is invalid or corrupted.`,
+      );
+    }
+    return executeResumableRepairJob(source, store, checkpointStore, checkpoint, options);
+  }
+
 /**
  * Restores a `ProjectionStoreAdapter` from a `RollbackSnapshot` captured prior
  * to `applyReconciliationRepair`.
@@ -426,7 +756,9 @@ export async function reconcileAndRepair(
 export async function rollbackReconciliationRepair(
   store: ProjectionStoreAdapter,
   snapshot: RollbackSnapshot,
+  authorize?: RepairAuthorization,
 ): Promise<ReconciliationProjectionState> {
+  await requireRepairAuthorization(authorize);
   if (!snapshot || !snapshot.projectionBefore || !snapshot.snapshotId) {
     throw new ReconciliationRepairError(
       'ROLLBACK_INVALID_SNAPSHOT',

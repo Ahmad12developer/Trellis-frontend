@@ -65,7 +65,21 @@ run_retention_cleanup: {
     guest: DENY,
   },
 },
+repair_records: {
+  description: 'Repair orphaned or inconsistent derived records',
+  grants: {
+    admin: { scope: 'global', conditions: [{ type: 'requires_confirmation' }] },
+    maintainer: DENY,
+    contributor: DENY,
+    viewer: DENY,
+    guest: DENY,
+  },
+},
 ```
+
+`repair_records` is the authorization gate for the projection reconciliation
+repair job. It is admin-only and requires explicit confirmation; starting and
+resuming checkpointed repairs both re-check authorization.
 
 `PERMISSION_MATRIX` is that declaration expanded to one entry per action per
 role. Because `MATRIX` is typed `Record<Action, ActionDefinition>`, adding an
@@ -276,6 +290,14 @@ return `401`, and server secret misconfiguration returns `500`.
 | `?role=…&action=…` | the single matching entry |
 
 An unknown `role` or `action` is a `400`, not a fallback to some default.
+
+Before changing a role, an authorized operator can request a read-only preview
+from `POST /api/permissions/diff` with a body such as
+`{"fromRole":"viewer","toRole":"maintainer","scope":"project"}`. The response lists each action whose
+grant, scope, or conditions change and summarizes newly granted, revoked, and
+modified actions. The route requires `view_permissions` at project scope,
+returns `Cache-Control: no-store`, and does not persist a role or policy change.
+Mutation handlers must still repeat their own authorization checks.
 
 ## Adding an action
 
