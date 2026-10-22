@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
 import { requirePermission } from '@/lib/auth/guard';
 import { streamingExport, type ExportRequest as StreamingExportRequest, type RecordFetcher, type PermissionRecord } from '@/lib/export/streaming-export';
+import { operationRegistry } from '@/lib/cancellation';
 
 /**
  * #36 — Data export endpoint.
@@ -40,7 +41,10 @@ const ExportRequestSchema = z.object({
   to: z.string().datetime({ offset: true }).optional(),
   /** Format requested. Defaults to `json`. */
   format: z.enum(['json', 'csv']).optional().default('json'),
+  /** Optional client-supplied operation ID for tracking and remote cancellation. */
+  operationId: z.string().optional(),
 });
+
 
 type ExportRequest = z.infer<typeof ExportRequestSchema>;
 
@@ -238,14 +242,17 @@ export async function POST(request: NextRequest) {
     return authResult.response;
   }
 
-  // Create AbortController for cancellation support
-  const controller = new AbortController();
-  const signal = controller.signal;
-
-  // Set up timeout to cancel if client disconnects
-  request.signal.addEventListener('abort', () => {
-    controller.abort();
+  // Register with operation cancellation registry
+  const requestedOpId = parsed.data.operationId || request.headers.get('x-operation-id') || undefined;
+  const op = operationRegistry.register({
+    id: requestedOpId,
+    type: 'export',
+    ownerWallet: wallet,
+    metadata: { type, format },
+    signal: request.signal,
   });
+
+  const signal = op.signal;
 
   // Build the streaming export request
   const streamingRequest: StreamingExportRequest = {
@@ -280,11 +287,11 @@ export async function POST(request: NextRequest) {
 
   // Create a ReadableStream for the response
   const readable = new ReadableStream({
-    async start(controller) {
+    async start(streamController) {
       const encoder = new TextEncoder();
 
       const streamWriter = async (chunk: string) => {
-        controller.enqueue(encoder.encode(chunk));
+        streamController.enqueue(encoder.encode(chunk));
       };
 
       try {
@@ -295,13 +302,20 @@ export async function POST(request: NextRequest) {
           signal,
           { batchSize: 1000, debug: false },
         );
-        if (metadata.error && !metadata.cancelled) {
+
+        if (metadata.cancelled) {
+          // Operation was cancelled cleanly
+        } else if (metadata.error) {
+          operationRegistry.fail(op.id, metadata.error);
           throw new Error(`Export failed: ${metadata.error}`);
+        } else {
+          operationRegistry.complete(op.id, { recordCount: metadata.recordCount });
         }
-        controller.close();
+        streamController.close();
       } catch (error) {
         console.error('Export error:', error);
-        controller.error(error);
+        operationRegistry.fail(op.id, error instanceof Error ? error.message : 'Export failed');
+        streamController.error(error);
       }
     },
   });
@@ -312,6 +326,7 @@ export async function POST(request: NextRequest) {
     headers: {
       'Content-Type': format === 'csv' ? 'text/csv' : 'application/json',
       'Content-Disposition': `attachment; filename="${type}-export.${format}"`,
+      'x-operation-id': op.id,
     },
   });
 }

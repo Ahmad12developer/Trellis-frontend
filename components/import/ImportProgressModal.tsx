@@ -8,20 +8,53 @@ export interface ImportProgress { processed: number; total: number; current_item
 export default function ImportProgressModal({ open, payload, onComplete }: { open: boolean; payload: string; onComplete?: (result: unknown) => void }) {
   const [progress, setProgress] = useState<ImportProgress>({ processed: 0, total: 0, errors: 0 });
   const [status, setStatus] = useState<'idle' | 'running' | 'complete' | 'cancelled' | 'error'>('idle');
+  const [cancellationMessage, setCancellationMessage] = useState<string | null>(null);
   const controller = useRef<AbortController | null>(null);
   const trapRef = useFocusTrap<HTMLDivElement>({ active: open });
 
   async function start() {
-    controller.current = new AbortController(); setStatus('running');
-    const response = await fetch('/api/import?stream=true', { method: 'POST', headers: { Accept: 'text/event-stream', 'Content-Type': 'text/csv' }, body: payload, signal: controller.current.signal });
-    if (!response.body) { setStatus('error'); return; }
-    const reader = response.body.pipeThrough(new TextDecoderStream()).getReader(); let buffer = '';
-    while (true) {
-      const chunk = await reader.read(); if (chunk.done) break; buffer += chunk.value;
-      const events = buffer.split('\n\n'); buffer = events.pop() ?? '';
-      for (const event of events) {
-        const data = event.split('\n').find((line) => line.startsWith('data:'))?.slice(5).trim(); if (!data) continue;
-        const parsed = JSON.parse(data); if (event.startsWith('event: progress')) setProgress(parsed); else if (event.startsWith('event: complete')) { setStatus('complete'); onComplete?.(parsed); } else if (event.startsWith('event: cancelled')) setStatus('cancelled'); else if (event.startsWith('event: error')) setStatus('error');
+    controller.current = new AbortController();
+    setStatus('running');
+    setCancellationMessage(null);
+    try {
+      const response = await fetch('/api/import?stream=true', {
+        method: 'POST',
+        headers: { Accept: 'text/event-stream', 'Content-Type': 'text/csv' },
+        body: payload,
+        signal: controller.current.signal,
+      });
+      if (!response.body) { setStatus('error'); return; }
+      const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+      let buffer = '';
+      while (true) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        buffer += chunk.value;
+        const events = buffer.split('\n\n');
+        buffer = events.pop() ?? '';
+        for (const event of events) {
+          const data = event.split('\n').find((line) => line.startsWith('data:'))?.slice(5).trim();
+          if (!data) continue;
+          const parsed = JSON.parse(data);
+          if (event.startsWith('event: progress')) {
+            setProgress(parsed);
+          } else if (event.startsWith('event: complete')) {
+            setStatus('complete');
+            onComplete?.(parsed);
+          } else if (event.startsWith('event: cancelled')) {
+            setStatus('cancelled');
+            setCancellationMessage(parsed.cancellationReason || 'Import cancelled safely. State was rolled back.');
+          } else if (event.startsWith('event: error')) {
+            setStatus('error');
+          }
+        }
+      }
+    } catch (err: unknown) {
+      if (controller.current?.signal.aborted) {
+        setStatus('cancelled');
+        setCancellationMessage('Import cancelled safely.');
+      } else {
+        setStatus('error');
       }
     }
   }
@@ -39,11 +72,20 @@ export default function ImportProgressModal({ open, payload, onComplete }: { ope
       <div className="w-full max-w-md rounded-2xl bg-white p-6 text-gray-900 shadow-xl">
         <h2 className="text-lg font-semibold">Importing records</h2>
         <p className="mt-2 text-sm text-gray-600">
-          {status === 'idle' ? 'Ready to import.' : `${percentage}% complete`}
+          {status === 'idle'
+            ? 'Ready to import.'
+            : status === 'cancelled'
+            ? 'Import cancelled safely.'
+            : `${percentage}% complete`}
         </p>
         <progress className="mt-4 w-full" max="100" value={percentage} />
         {progress.current_item && (
           <p className="mt-2 truncate text-xs text-gray-500">{progress.current_item}</p>
+        )}
+        {status === 'cancelled' && (
+          <div className="mt-3 rounded-md bg-amber-50 p-2 text-xs text-amber-800 border border-amber-200">
+            {cancellationMessage || 'Import cancelled. Any partially applied writes have been safely rolled back.'}
+          </div>
         )}
         <div className="mt-5 flex gap-2">
           <button
@@ -52,11 +94,15 @@ export default function ImportProgressModal({ open, payload, onComplete }: { ope
             disabled={status === 'running'}
             className="rounded bg-black px-3 py-2 text-sm text-white disabled:opacity-50"
           >
-            {status === 'complete' ? 'Imported' : 'Start import'}
+            {status === 'complete' ? 'Imported' : status === 'cancelled' ? 'Retry import' : 'Start import'}
           </button>
           <button
             type="button"
-            onClick={() => { controller.current?.abort(); setStatus('cancelled'); }}
+            onClick={() => {
+              controller.current?.abort();
+              setStatus('cancelled');
+              setCancellationMessage('Cancelling import and restoring pre-import snapshot...');
+            }}
             disabled={status !== 'running'}
             className="rounded border px-3 py-2 text-sm"
           >
@@ -67,3 +113,4 @@ export default function ImportProgressModal({ open, payload, onComplete }: { ope
     </div>
   );
 }
+

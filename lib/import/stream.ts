@@ -3,22 +3,41 @@ import { runImportPipeline } from './pipeline';
 
 export async function runImportPipelineWithProgress(
   input: string | Record<string, any>[],
-  options: ImportOptions,
+  options: ImportOptions = {},
   onProgress: (progress: ImportProgress) => void,
   signal?: AbortSignal,
-): Promise<ImportResult | { cancelled: true }> {
+): Promise<ImportResult> {
+  const effectiveSignal = options.signal || signal;
+
   const total = typeof input === 'string'
     ? Math.max(0, input.trim().split(/\r?\n/).length - 1)
     : input.length;
 
-  for (let processed = 0; processed < total; processed += 1) {
-    if (signal?.aborted) return { cancelled: true };
-    onProgress({ processed, total, current_item: `row-${processed + 1}`, errors: 0 });
-    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  if (effectiveSignal?.aborted) {
+    const cancelledResult = runImportPipeline(input, {
+      ...options,
+      signal: effectiveSignal,
+    });
+    return cancelledResult;
   }
 
-  if (signal?.aborted) return { cancelled: true };
-  const result = runImportPipeline(input, options);
-  onProgress({ processed: total, total, errors: result.summary.errorCount });
+  const result = runImportPipeline(input, {
+    ...options,
+    signal: effectiveSignal,
+    onProgress: (prog) => {
+      onProgress(prog);
+      if (options.onProgress) {
+        options.onProgress(prog);
+      }
+    },
+  });
+
+  onProgress({
+    processed: result.summary.totalRows,
+    total: result.summary.totalRows,
+    errors: result.summary.errorCount,
+  });
+
   return result;
 }
+

@@ -155,6 +155,8 @@ export interface ExportMetadata {
   exportedAt: string;
   /** Whether the export was cancelled. */
   cancelled: boolean;
+  /** Reason for cancellation if export was cancelled. */
+  cancellationReason?: string;
   /** Error message if the export failed. */
   error?: string;
 }
@@ -461,7 +463,11 @@ async function fetchWithRetry(
     try {
       return await fetcher(offset, limit, signal);
     } catch (error) {
-      if (attempt >= config.maxRetries || signal.aborted) {
+      if (signal.aborted || (error instanceof Error && error.name === 'AbortError')) {
+        return [];
+      }
+
+      if (attempt >= config.maxRetries) {
         throw error;
       }
 
@@ -475,9 +481,14 @@ async function fetchWithRetry(
         timer = setTimeout(finish, config.retryDelayMs);
         signal.addEventListener('abort', finish, { once: true });
       });
+
+      if (signal.aborted) {
+        return [];
+      }
     }
   }
 }
+
 
 // ============================================================================
 // Main Export Pipeline
@@ -548,6 +559,7 @@ export async function streamingExport(
       // Check cancellation before fetching
       if (signal.aborted) {
         metadata.cancelled = true;
+        metadata.cancellationReason = 'Export was cancelled via abort signal';
         break;
       }
 
@@ -562,6 +574,7 @@ export async function streamingExport(
 
       if (signal.aborted) {
         metadata.cancelled = true;
+        metadata.cancellationReason = 'Export was cancelled via abort signal';
         break;
       }
 
@@ -589,6 +602,7 @@ export async function streamingExport(
       // Handle cancellation or error
       if (result.cancelled) {
         metadata.cancelled = true;
+        metadata.cancellationReason = 'Export was cancelled via abort signal';
         break;
       }
 
@@ -604,16 +618,30 @@ export async function streamingExport(
 
     // Write format-specific footer
     if (request.format === 'json') {
-      await writer('\n]');
+      try {
+        await writer('\n]');
+      } catch {
+        // StreamWriter may fail if client abruptly dropped connection; handle safely
+      }
     }
 
   } catch (error) {
-    metadata.error = error instanceof Error ? error.message : 'Unknown error during export';
-    metadata.cancelled = signal.aborted;
+    const isAborted = signal.aborted || (error instanceof Error && error.name === 'AbortError');
+    metadata.cancelled = isAborted;
+    if (isAborted) {
+      metadata.cancellationReason = 'Export was cancelled via abort signal';
+    } else {
+      metadata.error = error instanceof Error ? error.message : 'Unknown error during export';
+    }
+  }
+
+  if (metadata.cancelled && !metadata.cancellationReason) {
+    metadata.cancellationReason = 'Export was cancelled via abort signal';
   }
 
   return metadata;
 }
+
 
 // ============================================================================
 // Validation Schemas
@@ -653,5 +681,7 @@ export const ExportMetadataSchema = z.object({
   redactedFieldCount: z.number().int().nonnegative(),
   exportedAt: z.string(),
   cancelled: z.boolean(),
+  cancellationReason: z.string().optional(),
   error: z.string().optional(),
 });
+

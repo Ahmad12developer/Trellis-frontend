@@ -303,6 +303,40 @@ export function runImportPipeline(
     };
   }
 
+  // Check cancellation before processing
+  if (options.signal?.aborted) {
+    return {
+      success: false,
+      cancelled: true,
+      cancellationReason: 'Import was cancelled before processing started',
+      cancelledAt: new Date().toISOString(),
+      dryRun: isDryRun,
+      entityType,
+      summary: {
+        totalRows: rawRows.length,
+        validRows: 0,
+        invalidRows: 0,
+        createCount: 0,
+        updateCount: 0,
+        skipCount: 0,
+        errorCount: 0,
+        duplicateCount: 0,
+      },
+      rows: [],
+      errors: ['Import cancelled before processing'],
+      rollbackGuidance: {
+        snapshotId: `snap_${Date.now()}`,
+        timestamp: new Date().toISOString(),
+        rollbackSupported: true,
+        totalAffectedRecords: 0,
+        affectedExternalIds: [],
+        remediationSteps: ['Import was cancelled prior to validation or persistent storage.'],
+        compensationSteps: [],
+      },
+      appliedRecords: [],
+    };
+  }
+
   // 2. Validate and Plan Actions
   const existingStore = importStore.getStore(entityType);
   const seenBatchIds = new Set<string>();
@@ -318,9 +352,51 @@ export function runImportPipeline(
   const affectedExternalIds: string[] = [];
 
   for (let i = 0; i < rawRows.length; i++) {
+    if (options.signal?.aborted) {
+      return {
+        success: false,
+        cancelled: true,
+        cancellationReason: `Import was cancelled during row validation (row ${i + 1} of ${rawRows.length})`,
+        cancelledAt: new Date().toISOString(),
+        dryRun: isDryRun,
+        entityType,
+        summary: {
+          totalRows: rawRows.length,
+          validRows: validationResults.filter((r) => r.valid).length,
+          invalidRows: validationResults.filter((r) => !r.valid).length,
+          createCount,
+          updateCount,
+          skipCount,
+          errorCount,
+          duplicateCount,
+        },
+        rows: validationResults,
+        errors: ['Import cancelled during validation'],
+        rollbackGuidance: {
+          snapshotId: `snap_${Date.now()}`,
+          timestamp: new Date().toISOString(),
+          rollbackSupported: true,
+          totalAffectedRecords: 0,
+          affectedExternalIds: [],
+          remediationSteps: ['Import cancelled during validation; no records were written.'],
+          compensationSteps: [],
+        },
+        appliedRecords: [],
+      };
+    }
+
     const rowNumber = i + 1;
     const row = rawRows[i];
     const externalId = row[idKey] !== undefined && row[idKey] !== null ? String(row[idKey]) : undefined;
+
+    if (options.onProgress) {
+      options.onProgress({
+        processed: i,
+        total: rawRows.length,
+        current_item: externalId || `row-${rowNumber}`,
+        errors: errorCount,
+      });
+    }
 
     // Validate Schema
     const val = validateRow(row, schema, rowNumber);
@@ -444,7 +520,58 @@ export function runImportPipeline(
   // 4. Apply Persistent Writes (ONLY IF dryRun === false)
   const appliedRecords: Record<string, any>[] = [];
   if (!isDryRun && isOverallSuccess) {
-    for (const res of validationResults) {
+    const preWriteSnapshotId = importStore.createSnapshot(entityType);
+
+    for (let i = 0; i < validationResults.length; i++) {
+      const res = validationResults[i];
+
+      if (options.onProgress) {
+        options.onProgress({
+          processed: i,
+          total: validationResults.length,
+          current_item: `write-${res.externalId || i + 1}`,
+          errors: 0,
+        });
+      }
+
+      if (options.signal?.aborted) {
+        // CANCELLATION DETECTED DURING WRITES!
+        // Execute automatic safe rollback to pre-write snapshot
+        importStore.restoreSnapshot(preWriteSnapshotId);
+
+        return {
+          success: false,
+          cancelled: true,
+          cancellationReason: `Import was cancelled mid-write (row ${i + 1} of ${validationResults.length}); state safely rolled back to pre-import snapshot`,
+          cancelledAt: new Date().toISOString(),
+          dryRun: false,
+          entityType,
+          summary: {
+            totalRows: rawRows.length,
+            validRows,
+            invalidRows,
+            createCount,
+            updateCount,
+            skipCount,
+            errorCount,
+            duplicateCount,
+          },
+          rows: validationResults,
+          errors: ['Import was cancelled during write execution. Automatic rollback restored previous state.'],
+          rollbackGuidance: {
+            ...rollbackGuidance,
+            snapshotId: preWriteSnapshotId,
+            remediationSteps: [
+              'Import was cancelled during persistent write execution.',
+              'All partially written records were automatically rolled back to snapshot.',
+              'Database state remains consistent and uncorrupted.',
+              'Import can be safely retried idempotently when ready.',
+            ],
+          },
+          appliedRecords: [],
+        };
+      }
+
       if (!res.valid || res.action === 'skip') continue;
       const recId = res.externalId || `gen_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
       const savedData = { ...res.data, [idKey]: recId };

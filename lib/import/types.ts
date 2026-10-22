@@ -49,6 +49,8 @@ export interface ImportOptions {
   allowUpdate?: boolean;
   stopOnError?: boolean;
   externalIdKey?: string;
+  signal?: AbortSignal;
+  onProgress?: (progress: ImportProgress) => void;
 }
 
 export interface ImportProgress {
@@ -98,4 +100,8 @@ export interface ImportResult {
   errors: string[];
   rollbackGuidance?: RollbackGuidance;
   appliedRecords?: Record<string, any>[];
+  cancelled?: boolean;
+  cancellationReason?: string;
+  cancelledAt?: string;
 }
+

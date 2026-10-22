@@ -48,75 +48,86 @@ The permission-aware export pipeline (`lib/export/streaming-export.ts`) provides
 
 ## Operational Edge Cases
 
-### 1. Client Disconnection
+#### 1. Client Disconnection & Socket Abort
 
-**Scenario**: Client aborts the request mid-export.
+**Scenario**: Client aborts the HTTP request mid-export or network drops.
 
 **Behavior**:
-- AbortController signal propagates immediately
-- Current batch completes processing
-- No new batches are fetched
-- Stream closes gracefully
-- Metadata marks export as `cancelled: true`
+- AbortController signal propagates immediately to all in-flight fetchers and stream writers.
+- If an individual batch fetch is in-flight, it receives `signal.aborted` and returns cleanly without throwing unhandled exceptions.
+- No new batches are fetched.
+- StreamWriter catches potential socket write failures gracefully (e.g. Broken pipe or disconnected stream).
+- Metadata marks export as `cancelled: true` and records `cancellationReason: 'Export was cancelled via abort signal'`.
+- `metadata.error` is NOT populated with false failure logs, keeping telemetry clean and distinguished from unexpected errors.
 
-**Monitoring**: Track `cancelled` flag in export metadata. High cancellation rates may indicate:
+**Monitoring**: Track `cancelled` flag in export metadata and operation registry. High cancellation rates may indicate:
 - Network instability
 - Client timeout configuration too aggressive
 - Overly large exports
 
-**Recovery**: Client can retry the export with the same parameters.
+**Recovery**: Client can safely retry the export with the same parameters or narrower date boundaries.
 
-### 2. Database Connection Failure
+### 2. Cancellation During Retry Backoff Delay
+
+**Scenario**: Fetcher encounters a transient network error, begins exponential/configured backoff delay (`setTimeout`), and the client or operator cancels during the waiting window.
+
+**Behavior**:
+- `fetchWithRetry` attaches a `{ once: true }` listener to `signal`'s `abort` event.
+- The abort event fires immediately, clears the pending timer (`clearTimeout(timer)`), and resolves the backoff promise without delay.
+- The retry loop checks `signal.aborted`, short-circuits immediately, and returns an empty record set `[]`.
+- Avoids blocking server threads or delaying HTTP connection termination for the remainder of `retryDelayMs`.
+
+**Recovery**: Operation transitions cleanly to `cancelled`. No retries are scheduled.
+
+### 3. Remote Operation Cancellation & Authorization
+
+**Scenario**: A long-running export is initiated with an operation ID (via `operationId` in body or `x-operation-id` header), and needs to be cancelled remotely via `POST /api/operations/cancel`.
+
+**Behavior**:
+- Endpoint verifies caller identity and role.
+- `admin` and `maintainer`: Can cancel any export operation across the platform.
+- `contributor`: Can only cancel export operations owned by their own wallet.
+- `viewer` and `guest`: Rejection with `403 Forbidden`.
+- The cancellation registry triggers the active operation's `AbortController.abort()`, sets status to `cancelled`, and records `cancelledBy`, `cancelledAt`, and `cancellationReason`.
+- In-flight export pipeline detects the abort signal and closes the stream.
+
+**Recovery**: Status can be verified via `GET /api/operations?id=<operationId>`.
+
+### 4. Database Connection Failure
 
 **Scenario**: Database becomes unavailable during export.
 
 **Behavior**:
-- Fetcher throws error
-- Export pipeline catches error
-- Metadata includes `error` field with error message
-- Stream closes with error state
-- Partial data may have been sent to client
-
-**Monitoring**: Track `error` field in metadata. Common patterns:
-- Connection timeouts: Check DB health
-- Query timeouts: Increase `batchTimeoutMs` or optimize queries
-- Deadlocks: Review DB isolation levels
+- Fetcher throws error.
+- Pipeline retries up to `config.maxRetries`.
+- If retries are exhausted without an abort signal, error is recorded in `metadata.error` and stream terminates.
+- Distinct from cancellation: `metadata.cancelled` remains `false`.
 
 **Recovery**:
-- Check database health
-- Verify query performance
-- Retry export after issue resolution
+- Check database health.
+- Verify query performance.
+- Retry export after database connectivity is restored.
 
-### 3. Memory Pressure
+### 5. Memory Pressure & Bounded Streaming
 
 **Scenario**: Server memory usage approaches limits during large export.
 
 **Behavior**:
-- Batch processing enforces bounded memory
-- Each batch is fully processed before next fetch
-- Stream backpressure prevents unbounded buffering
-- If `maxMemoryBytes` is exceeded, consider reducing `batchSize`
+- Batch processing enforces bounded memory.
+- Each batch is fully processed before next fetch.
+- Stream backpressure prevents unbounded buffering.
+- If `maxMemoryBytes` is exceeded, consider reducing `batchSize`.
 
 **Monitoring**:
-- Track memory usage during exports
-- Monitor batch processing times
-- Alert on memory thresholds
+- Track memory usage during exports.
+- Monitor batch processing times.
+- Alert on memory thresholds.
 
 **Recovery**:
-- Reduce `batchSize` in configuration
-- Implement rate limiting for concurrent exports
-- Add horizontal scaling for export endpoints
+- Reduce `batchSize` in configuration.
+- Implement rate limiting for concurrent exports.
+- Add horizontal scaling for export endpoints.
 
-### 4. Permission Changes Mid-Export
-
-**Scenario**: User's role changes while export is in progress.
-
-**Behavior**:
-- Export uses role determined at authorization time
-- Changes during export do not affect in-flight export
-- Subsequent exports use new role
-
-**Monitoring**: Audit logs show role at export start time.
 
 **Recovery**: None needed by design. Role is captured at authorization phase.
 

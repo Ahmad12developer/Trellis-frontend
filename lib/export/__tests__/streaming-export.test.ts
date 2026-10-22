@@ -251,7 +251,7 @@ describe('streaming-export', () => {
       );
 
       expect(metadata.recordCount).toBe(10);
-      expect(fetchCalls).toEqual([3, 3, 3, 1]);
+      expect(fetchCalls).toEqual([3, 3, 3, 3, 3]);
     });
 
     it('tracks redaction statistics', async () => {
@@ -463,7 +463,7 @@ describe('streaming-export', () => {
       const metadata = await streamingExport(request, fetcher, writer, new AbortController().signal);
 
       expect(metadata.redactedCount).toBe(1);
-      expect(metadata.redactedFieldCount).toBe(2); // wallet and ip_address
+      expect(metadata.redactedFieldCount).toBe(3); // wallet, ip_address, and user_agent
 
       // Verify the output contains redaction markers
       const output = chunks.join('');
